@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+anime-parsers-ru[async,lxml]
+python-multipart
+sqlalchemy
+psycopg2-binary
+python-jose[cryptography]
+passlib[bcrypt]
+python-dotenv
+pydantic

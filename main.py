@@ -1,0 +1,1107 @@
+from fastapi import FastAPI, HTTPException, Depends, status, Request  
+from fastapi.responses import JSONResponse 
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+from sqlalchemy import func, desc
+from typing import List, Optional
+
+
+from database import get_db, init_db
+from models import User, Favorite, WatchedAnime, WatchHistory, Friendship, Notification  
+from schemas import (
+    UserRegister, Token, UserProfile, UserProfileUpdate,
+    FavoriteAdd, FavoriteItem,
+    WatchedAnimeUpdate, WatchedAnimeItem,
+    WatchHistoryAdd, WatchHistoryItem,
+    UserShort, FriendshipCreate, FriendshipItem, FriendshipResponse, NotificationItem
+)
+from auth import (
+    get_password_hash, verify_password, create_access_token,
+    get_current_active_user, verify_admin_key
+)
+
+# Импорт парсера аниме
+from parsers.kodik_api import (
+    search_anime,
+    get_anime_details,
+    get_video_m3u8,
+    get_trending_anime,
+    get_anime_by_genre 
+)
+
+
+# Создаём таблицы при запуске
+init_db()
+
+app = FastAPI(
+    title="Anime Cinema API",
+    version="3.0.0",
+    description="API для просмотра аниме через Kodik с авторизацией"
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ═══════════════════════════════════════════
+# ROOT & HEALTH
+# ═══════════════════════════════════════════
+
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "Anime Cinema API",
+        "version": "3.0.0",
+        "database": "PostgreSQL",
+        "features": ["auth", "profiles", "favorites", "history"]
+    }
+
+
+@app.get("/api/health")
+async def health(db: Session = Depends(get_db)):
+    """Проверка работоспособности"""
+    try:
+        db.connection()
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return {
+            "status": "unhealthy", 
+            "database": "disconnected", 
+            "error": str(e)
+        }
+
+
+# ═══════════════════════════════════════════
+# АВТОРИЗАЦИЯ
+# ═══════════════════════════════════════════
+
+@app.post("/api/auth/register", response_model=Token, status_code=status.HTTP_201_CREATED)
+async def register(user_data: UserRegister, db: Session = Depends(get_db)):
+    """
+    Регистрация нового пользователя (только с админским ключом!)
+    """
+    if not verify_admin_key(user_data.admin_key):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Неверный ключ регистрации"
+        )
+    
+    if db.query(User).filter(User.username == user_data.username).first():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Пользователь с таким именем уже существует"
+        )
+    
+    new_user = User(
+        username=user_data.username.lower(),
+        name=user_data.name,
+        hashed_password=get_password_hash(user_data.password)
+    )
+    
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    access_token = create_access_token(data={"sub": new_user.username})
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.post("/api/auth/login", response_model=Token)
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    """
+    Вход в систему
+    """
+    user = db.query(User).filter(User.username == form_data.username.lower()).first()
+    
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Неверный логин или пароль",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Аккаунт деактивирован"
+        )
+    
+    access_token = create_access_token(data={"sub": user.username})
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+# ═══════════════════════════════════════════
+# ПРОФИЛЬ
+# ═══════════════════════════════════════════
+
+@app.get("/api/profile/me", response_model=UserProfile)
+async def get_my_profile(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Получение профиля текущего пользователя"""
+    stats = db.query(
+        func.count(WatchedAnime.id).label('total'),
+        func.coalesce(func.sum(WatchedAnime.episodes_watched), 0).label('episodes')
+    ).filter(WatchedAnime.user_id == current_user.id).first()
+    
+    favorites_count = db.query(func.count(Favorite.id)).filter(
+        Favorite.user_id == current_user.id
+    ).scalar()
+    
+    total_hours = int((stats.episodes * 24) // 60)
+    
+    return UserProfile(
+        id=current_user.id,
+        username=current_user.username,
+        name=current_user.name,
+        avatar_url=current_user.avatar_url,
+        cover_url=current_user.cover_url,
+        bio=current_user.bio,
+        created_at=current_user.created_at,
+        total_anime=stats.total or 0,
+        total_episodes=int(stats.episodes),
+        total_hours=total_hours,
+        favorites_count=favorites_count or 0
+    )
+
+
+@app.put("/api/profile/me", response_model=UserProfile)
+async def update_profile(
+    profile_data: UserProfileUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Обновление профиля"""
+    for key, value in profile_data.dict(exclude_unset=True).items():
+        setattr(current_user, key, value)
+    
+    db.commit()
+    db.refresh(current_user)
+    
+    return await get_my_profile(current_user, db)
+
+# Добавьте этот эндпоинт после /api/profile/me
+
+@app.get("/api/profile/{user_id}", response_model=UserProfile)
+async def get_user_profile(
+    user_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Получение профиля любого пользователя (публичная информация)
+    """
+    # Ищем пользователя
+    user = db.query(User).filter(User.id == user_id).first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Пользователь не найден"
+        )
+    
+    # Подсчёт статистики
+    stats = db.query(
+        func.count(WatchedAnime.id).label('total'),
+        func.coalesce(func.sum(WatchedAnime.episodes_watched), 0).label('episodes')
+    ).filter(WatchedAnime.user_id == user.id).first()
+    
+    favorites_count = db.query(func.count(Favorite.id)).filter(
+        Favorite.user_id == user.id
+    ).scalar()
+    
+    total_hours = int((stats.episodes * 24) // 60)
+    
+    return UserProfile(
+        id=user.id,
+        username=user.username,
+        name=user.name,
+        avatar_url=user.avatar_url,
+        cover_url=user.cover_url,
+        bio=user.bio,
+        created_at=user.created_at,
+        total_anime=stats.total or 0,
+        total_episodes=int(stats.episodes) if stats.episodes else 0,
+        total_hours=total_hours,
+        favorites_count=favorites_count or 0
+    )
+
+
+# Также добавьте эндпоинты для получения чужого избранного и истории
+
+@app.get("/api/profile/{user_id}/favorites", response_model=List[FavoriteItem])
+async def get_user_favorites(
+    user_id: int,
+    limit: int = 50,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Получение избранного другого пользователя"""
+    # Проверяем существование пользователя
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "Пользователь не найден")
+    
+    favorites = db.query(Favorite).filter(
+        Favorite.user_id == user_id
+    ).order_by(desc(Favorite.added_at)).limit(limit).all()
+    
+    return favorites
+
+
+@app.get("/api/profile/{user_id}/history", response_model=List[WatchHistoryItem])
+async def get_user_history(
+    user_id: int,
+    limit: int = 50,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Получение истории другого пользователя"""
+    # Проверяем существование пользователя
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "Пользователь не найден")
+    
+    history = db.query(WatchHistory).filter(
+        WatchHistory.user_id == user_id
+    ).order_by(desc(WatchHistory.watched_at)).limit(limit).all()
+    
+    return history
+
+# ═══════════════════════════════════════════
+# ЖАНРЫ
+# ═══════════════════════════════════════════
+
+@app.get("/api/genres")
+async def get_genres():
+    """
+    Получить список всех доступных жанров
+    Публичный эндпоинт (не требует авторизации)
+    """
+    genres = [
+        {"name": "Экшен", "slug": "экшен", "icon": "⚔️"},
+        {"name": "Приключения", "slug": "приключения", "icon": "🗺️"},
+        {"name": "Комедия", "slug": "комедия", "icon": "😂"},
+        {"name": "Драма", "slug": "драма", "icon": "🎭"},
+        {"name": "Фэнтези", "slug": "фэнтези", "icon": "🔮"},
+        {"name": "Романтика", "slug": "романтика", "icon": "💕"},
+        {"name": "Sci-Fi", "slug": "sci-fi", "icon": "🚀"},
+        {"name": "Триллер", "slug": "триллер", "icon": "🔪"},
+        {"name": "Мистика", "slug": "мистика", "icon": "👻"},
+        {"name": "Психология", "slug": "психология", "icon": "🧠"},
+        {"name": "Школа", "slug": "школа", "icon": "🏫"},
+        {"name": "Спорт", "slug": "спорт", "icon": "⚽"},
+        {"name": "Сёнэн", "slug": "сёнэн", "icon": "👊"},
+        {"name": "Сёдзё", "slug": "сёдзё", "icon": "🌸"},
+        {"name": "Сэйнэн", "slug": "сэйнэн", "icon": "🎯"},
+        {"name": "Меха", "slug": "меха", "icon": "🤖"},
+        {"name": "Музыка", "slug": "музыка", "icon": "🎵"},
+        {"name": "Детектив", "slug": "детектив", "icon": "🔍"},
+        {"name": "Ужасы", "slug": "ужасы", "icon": "😱"},
+        {"name": "Повседневность", "slug": "повседневность", "icon": "☕"},
+        {"name": "Военное", "slug": "военное", "icon": "🎖️"},
+        {"name": "История", "slug": "история", "icon": "📜"},
+        {"name": "Безумие", "slug": "безумие", "icon": "🌀"},
+        {"name": "Демоны", "slug": "демоны", "icon": "😈"},
+        {"name": "Игры", "slug": "игры", "icon": "🎮"},
+        {"name": "Магия", "slug": "магия", "icon": "✨"},
+        {"name": "Пародия", "slug": "пародия", "icon": "🤡"},
+        {"name": "Самураи", "slug": "самураи", "icon": "🗡️"},
+        {"name": "Супер сила", "slug": "супер сила", "icon": "💪"},
+        {"name": "Вампиры", "slug": "вампиры", "icon": "🧛"},
+    ]
+    
+    return genres
+
+
+@app.get("/api/genres/{genre}/anime")
+async def get_anime_by_genre_endpoint(
+    genre: str,
+    page: int = 1,      # ✅ Теперь используем page вместо offset
+    limit: int = 10
+):
+    """
+    Получить аниме по жанру с пагинацией
+    
+    page=1 → первые 10
+    page=2 → следующие 10
+    page=3 → ещё 10
+    и так далее...
+    """
+    try:
+        data = await get_anime_by_genre(genre, page=page, per_page=limit)
+        
+        return {
+            "genre": genre,
+            "page": page,
+            "limit": limit,
+            "results": data["results"],
+            "has_more": data["has_more"]
+        }
+        
+    except Exception as e:
+        print(f"❌ Ошибка: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка получения аниме: {str(e)}"
+        )
+
+
+# ═══════════════════════════════════════════
+# ИЗБРАННОЕ
+# ═══════════════════════════════════════════
+
+@app.get("/api/favorites", response_model=List[FavoriteItem])
+async def get_favorites(
+    limit: int = 50,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Список избранного"""
+    return db.query(Favorite).filter(
+        Favorite.user_id == current_user.id
+    ).order_by(desc(Favorite.added_at)).limit(limit).all()
+
+
+@app.post("/api/favorites", response_model=FavoriteItem, status_code=status.HTTP_201_CREATED)
+async def add_favorite(
+    data: FavoriteAdd,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Добавить в избранное"""
+    if db.query(Favorite).filter(
+        Favorite.user_id == current_user.id,
+        Favorite.anime_id == data.anime_id
+    ).first():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Уже в избранном"
+        )
+    
+    new_fav = Favorite(user_id=current_user.id, **data.dict())
+    db.add(new_fav)
+    db.commit()
+    db.refresh(new_fav)
+    
+    return new_fav
+
+
+@app.delete("/api/favorites/{anime_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_favorite(
+    anime_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Удалить из избранного"""
+    deleted = db.query(Favorite).filter(
+        Favorite.user_id == current_user.id,
+        Favorite.anime_id == anime_id
+    ).delete()
+    
+    db.commit()
+    
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Не найдено"
+        )
+
+
+@app.get("/api/favorites/check/{anime_id}")
+async def check_favorite(
+    anime_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Проверить, в избранном ли аниме"""
+    exists = db.query(Favorite).filter(
+        Favorite.user_id == current_user.id,
+        Favorite.anime_id == anime_id
+    ).first() is not None
+    
+    return {"is_favorite": exists}
+
+
+# ═══════════════════════════════════════════
+# ПРОСМОТРЕННОЕ
+# ═══════════════════════════════════════════
+
+@app.get("/api/watched", response_model=List[WatchedAnimeItem])
+async def get_watched(
+    limit: int = 50,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Список просмотренного"""
+    return db.query(WatchedAnime).filter(
+        WatchedAnime.user_id == current_user.id
+    ).order_by(desc(WatchedAnime.last_watched)).limit(limit).all()
+
+
+@app.post("/api/watched", response_model=WatchedAnimeItem)
+async def update_watched(
+    data: WatchedAnimeUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Обновить прогресс просмотра"""
+    watched = db.query(WatchedAnime).filter(
+        WatchedAnime.user_id == current_user.id,
+        WatchedAnime.anime_id == data.anime_id
+    ).first()
+    
+    if watched:
+        for key, value in data.dict(exclude={'anime_id'}).items():
+            setattr(watched, key, value)
+        watched.last_watched = func.now()
+    else:
+        watched = WatchedAnime(user_id=current_user.id, **data.dict())
+        db.add(watched)
+    
+    db.commit()
+    db.refresh(watched)
+    
+    return watched
+
+
+@app.get("/api/watched/check/{anime_id}")
+async def check_watched(
+    anime_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Проверить статус просмотра"""
+    watched = db.query(WatchedAnime).filter(
+        WatchedAnime.user_id == current_user.id,
+        WatchedAnime.anime_id == anime_id
+    ).first()
+    
+    if not watched:
+        return {
+            "is_watched": False,
+            "episodes_watched": 0,
+            "is_completed": False
+        }
+    
+    return {
+        "is_watched": True,
+        "episodes_watched": watched.episodes_watched,
+        "total_episodes": watched.total_episodes,
+        "is_completed": watched.is_completed
+    }
+
+
+# ═══════════════════════════════════════════
+# ИСТОРИЯ ПРОСМОТРОВ
+# ═══════════════════════════════════════════
+
+@app.get("/api/history", response_model=List[WatchHistoryItem])
+async def get_history(
+    limit: int = 50,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """История просмотров"""
+    return db.query(WatchHistory).filter(
+        WatchHistory.user_id == current_user.id
+    ).order_by(desc(WatchHistory.watched_at)).limit(limit).all()
+
+
+@app.post("/api/history", response_model=WatchHistoryItem)
+async def add_history(
+    data: WatchHistoryAdd,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Добавить в историю"""
+    history = db.query(WatchHistory).filter(
+        WatchHistory.user_id == current_user.id,
+        WatchHistory.anime_id == data.anime_id,
+        WatchHistory.episode_num == data.episode_num
+    ).first()
+    
+    if history:
+        history.watched_at = func.now()
+        history.progress_seconds = data.progress_seconds
+        history.duration_seconds = data.duration_seconds
+    else:
+        history = WatchHistory(user_id=current_user.id, **data.dict())
+        db.add(history)
+    
+    db.commit()
+    db.refresh(history)
+    
+    return history
+
+
+# ═══════════════════════════════════════════
+# АНИМЕ (KODIK API) - ПУБЛИЧНЫЕ ЭНДПОИНТЫ
+# ═══════════════════════════════════════════
+
+@app.get("/api/search")
+async def api_search(title: str, limit: int = 12):
+    """
+    Поиск аниме по названию
+    Публичный эндпоинт (не требует авторизации)
+    """
+    if not title.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Введите название аниме"
+        )
+    
+    results = await search_anime(title, limit)
+    
+    return {
+        "query": title,
+        "count": len(results),
+        "results": results
+    }
+
+
+@app.get("/api/trending")
+async def api_trending(limit: int = 12):
+    """
+    Популярные аниме
+    Публичный эндпоинт (не требует авторизации)
+    """
+    results = await get_trending_anime(limit)
+    
+    return {
+        "count": len(results),
+        "results": results
+    }
+
+
+@app.get("/api/anime/{shikimori_id}")
+async def api_anime(shikimori_id: str):
+    """
+    Детальная информация об аниме
+    Публичный эндпоинт (не требует авторизации)
+    """
+    anime = await get_anime_details(shikimori_id)
+    
+    if not anime:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Аниме не найдено"
+        )
+    
+    return anime
+
+
+@app.get("/api/video/{shikimori_id}/{episode_num}/{translation_id}")
+async def api_video(
+    shikimori_id: str,
+    episode_num: int,
+    translation_id: str,
+    quality: Optional[int] = 720
+):
+    """
+    Получение ссылки на видео (m3u8)
+    Публичный эндпоинт (не требует авторизации)
+    """
+    url = await get_video_m3u8(
+        shikimori_id,
+        episode_num,
+        translation_id,
+        quality
+    )
+    
+    if not url:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Видео недоступно"
+        )
+    
+    return {
+        "m3u8_url": url,
+        "quality": quality,
+        "episode": episode_num,
+        "translation_id": translation_id
+    }
+
+# ═══════════════════════════════════════════
+# ПОЛЬЗОВАТЕЛИ (ПОИСК)
+# ═══════════════════════════════════════════
+
+@app.get("/api/users/search", response_model=List[UserShort])
+async def search_users(
+    query: str,
+    limit: int = 20,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Поиск пользователей по имени или username
+    """
+    if not query or len(query) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Запрос должен содержать минимум 2 символа"
+        )
+    
+    search_pattern = f"%{query.lower()}%"
+    
+    users = db.query(User).filter(
+        (func.lower(User.name).like(search_pattern)) |
+        (func.lower(User.username).like(search_pattern))
+    ).filter(
+        User.id != current_user.id  # Исключаем себя
+    ).limit(limit).all()
+    
+    return users
+
+
+@app.get("/api/users", response_model=List[UserShort])
+async def get_all_users(
+    limit: int = 50,
+    offset: int = 0,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Получить список всех пользователей
+    """
+    users = db.query(User).filter(
+        User.id != current_user.id  # Исключаем себя
+    ).offset(offset).limit(limit).all()
+    
+    return users
+
+# ═══════════════════════════════════════════
+# УВЕДОМЛЕНИЯ
+# ═══════════════════════════════════════════
+
+@app.get("/api/notifications", response_model=List[NotificationItem])
+async def get_notifications(
+    limit: int = 20,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Получить уведомления пользователя"""
+    notifications = db.query(Notification).filter(
+        Notification.user_id == current_user.id
+    ).order_by(desc(Notification.created_at)).limit(limit).all()
+    
+    return notifications
+
+
+@app.get("/api/notifications/unread/count")
+async def get_unread_count(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Получить количество непрочитанных уведомлений"""
+    count = db.query(func.count(Notification.id)).filter(
+        Notification.user_id == current_user.id,
+        Notification.is_read == False
+    ).scalar()
+    
+    return {"count": count or 0}
+
+
+@app.put("/api/notifications/{notification_id}/read")
+async def mark_notification_read(
+    notification_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Пометить уведомление как прочитанное"""
+    notification = db.query(Notification).filter(
+        Notification.id == notification_id,
+        Notification.user_id == current_user.id
+    ).first()
+    
+    if not notification:
+        raise HTTPException(404, "Уведомление не найдено")
+    
+    notification.is_read = True
+    db.commit()
+    
+    return {"success": True}
+
+
+@app.put("/api/notifications/read-all")
+async def mark_all_read(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Пометить все уведомления как прочитанные"""
+    db.query(Notification).filter(
+        Notification.user_id == current_user.id,
+        Notification.is_read == False
+    ).update({"is_read": True})
+    
+    db.commit()
+    
+    return {"success": True}
+
+
+# ═══════════════════════════════════════════
+# ДРУЗЬЯ
+# ═══════════════════════════════════════════
+
+@app.get("/api/friends", response_model=List[FriendshipResponse])
+async def get_friends(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Получить список друзей (только accepted)
+    """
+    # Друзья где я отправитель
+    sent_friendships = db.query(Friendship).filter(
+        Friendship.user_id == current_user.id,
+        Friendship.status == "accepted"
+    ).all()
+    
+    # Друзья где я получатель
+    received_friendships = db.query(Friendship).filter(
+        Friendship.friend_id == current_user.id,
+        Friendship.status == "accepted"
+    ).all()
+    
+    # Формируем ответ
+    result = []
+    
+    for fs in sent_friendships:
+        result.append(FriendshipResponse(
+            id=fs.id,
+            status=fs.status,
+            user=fs.user,
+            friend=fs.friend,
+            created_at=fs.created_at
+        ))
+    
+    for fs in received_friendships:
+        result.append(FriendshipResponse(
+            id=fs.id,
+            status=fs.status,
+            user=fs.user,
+            friend=fs.friend,
+            created_at=fs.created_at
+        ))
+    
+    return result
+
+
+@app.get("/api/friends/requests", response_model=List[FriendshipResponse])
+async def get_friend_requests(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Получить входящие заявки в друзья
+    """
+    requests = db.query(Friendship).filter(
+        Friendship.friend_id == current_user.id,
+        Friendship.status == "pending"
+    ).all()
+    
+    return [
+        FriendshipResponse(
+            id=r.id,
+            status=r.status,
+            user=r.user,
+            friend=r.friend,
+            created_at=r.created_at
+        )
+        for r in requests
+    ]
+
+
+#эндпоинт добавления в друзья
+@app.post("/api/friends/add", response_model=FriendshipResponse, status_code=status.HTTP_201_CREATED)
+async def add_friend(
+    data: FriendshipCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Отправить заявку в друзья"""
+    if data.friend_id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Нельзя добавить себя в друзья"
+        )
+    
+    friend = db.query(User).filter(User.id == data.friend_id).first()
+    if not friend:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Пользователь не найден"
+        )
+    
+    existing = db.query(Friendship).filter(
+        ((Friendship.user_id == current_user.id) & (Friendship.friend_id == data.friend_id)) |
+        ((Friendship.user_id == data.friend_id) & (Friendship.friend_id == current_user.id))
+    ).first()
+    
+    if existing:
+        if existing.status == "accepted":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Уже в друзьях"
+            )
+        elif existing.status == "pending":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Заявка уже отправлена"
+            )
+    
+    friendship = Friendship(
+        user_id=current_user.id,
+        friend_id=data.friend_id,
+        status="pending"
+    )
+    
+    db.add(friendship)
+    db.commit()
+    db.refresh(friendship)
+    
+    notification = Notification(
+        user_id=data.friend_id,
+        type="friend_request",
+        title="Новая заявка в друзья",
+        message=f"{current_user.name} хочет добавить вас в друзья",
+        sender_id=current_user.id,
+        sender_name=current_user.name,
+        sender_avatar=current_user.avatar_url
+    )
+    db.add(notification)
+    db.commit()
+    
+    return FriendshipResponse(
+        id=friendship.id,
+        status=friendship.status,
+        user=friendship.user,
+        friend=friendship.friend,
+        created_at=friendship.created_at
+    )
+
+
+
+@app.put("/api/friends/accept/{friendship_id}", response_model=FriendshipResponse)
+async def accept_friend_request(
+    friendship_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Принять заявку в друзья"""
+    friendship = db.query(Friendship).filter(
+        Friendship.id == friendship_id,
+        Friendship.friend_id == current_user.id,
+        Friendship.status == "pending"
+    ).first()
+    
+    if not friendship:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Заявка не найдена"
+        )
+    
+    friendship.status = "accepted"
+    friendship.updated_at = func.now()
+    
+    db.commit()
+    db.refresh(friendship)
+    
+    # ✅ Создаём уведомление отправителю
+    notification = Notification(
+        user_id=friendship.user_id,  # Отправителю заявки
+        type="friend_accepted",
+        title="Заявка принята",
+        message=f"{current_user.name} принял вашу заявку в друзья",
+        sender_id=current_user.id,
+        sender_name=current_user.name,
+        sender_avatar=current_user.avatar_url
+    )
+    db.add(notification)
+    db.commit()
+    
+    return FriendshipResponse(
+        id=friendship.id,
+        status=friendship.status,
+        user=friendship.user,
+        friend=friendship.friend,
+        created_at=friendship.created_at
+    )
+
+@app.get("/api/notifications/unread")
+async def get_unread_notifications_count(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Получить количество непрочитанных уведомлений"""
+    # Считаем входящие заявки
+    pending_requests = db.query(func.count(Friendship.id)).filter(
+        Friendship.friend_id == current_user.id,
+        Friendship.status == "pending"
+    ).scalar()
+    
+    return {
+        "count": pending_requests or 0
+    }
+
+
+@app.put("/api/friends/reject/{friendship_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def reject_friend_request(
+    friendship_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Отклонить заявку в друзья"""
+    friendship = db.query(Friendship).filter(
+        Friendship.id == friendship_id,
+        Friendship.friend_id == current_user.id,
+        Friendship.status == "pending"
+    ).first()
+    
+    if not friendship:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Заявка не найдена"
+        )
+    
+    # ✅ Создаём уведомление отправителю (опционально)
+    notification = Notification(
+        user_id=friendship.user_id,
+        type="friend_rejected",
+        title="Заявка отклонена",
+        message=f"{current_user.name} отклонил вашу заявку в друзья",
+        sender_id=current_user.id,
+        sender_name=current_user.name,
+        sender_avatar=current_user.avatar_url
+    )
+    db.add(notification)
+    
+    # Удаляем заявку
+    db.delete(friendship)
+    db.commit()
+
+@app.delete("/api/friends/{friendship_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_friend(
+    friendship_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Удалить из друзей
+    """
+    friendship = db.query(Friendship).filter(
+        Friendship.id == friendship_id,
+        ((Friendship.user_id == current_user.id) | (Friendship.friend_id == current_user.id))
+    ).first()
+    
+    if not friendship:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Дружба не найдена"
+        )
+    
+    db.delete(friendship)
+    db.commit()
+
+
+@app.get("/api/friends/check/{user_id}")
+async def check_friendship(
+    user_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Проверить статус дружбы с пользователем
+    """
+    friendship = db.query(Friendship).filter(
+        ((Friendship.user_id == current_user.id) & (Friendship.friend_id == user_id)) |
+        ((Friendship.user_id == user_id) & (Friendship.friend_id == current_user.id))
+    ).first()
+    
+    if not friendship:
+        return {
+            "is_friend": False,
+            "status": None,
+            "friendship_id": None,
+            "is_sender": False
+        }
+    
+    return {
+        "is_friend": friendship.status == "accepted",
+        "status": friendship.status,
+        "friendship_id": friendship.id,
+        "is_sender": friendship.user_id == current_user.id
+    }
+
+
+# ═══════════════════════════════════════════
+# ERROR HANDLERS
+# ═══════════════════════════════════════════
+
+from fastapi.responses import JSONResponse
+from fastapi import Request
+
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": "Не найдено",
+            "detail": str(exc.detail) if hasattr(exc, 'detail') else str(exc),
+            "status_code": 404
+        }
+    )
+
+
+@app.exception_handler(500)
+async def server_error_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Ошибка сервера",
+            "detail": str(exc),
+            "status_code": 500
+        }
+    )
+
+
+# Добавьте общий обработчик для всех HTTPException
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code
+        }
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
