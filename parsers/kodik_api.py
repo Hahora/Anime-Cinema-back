@@ -1,3 +1,4 @@
+import re
 from typing import List, Dict, Any, Optional
 from anime_parsers_ru import KodikParserAsync
 import asyncio
@@ -26,6 +27,25 @@ def normalize_shikimori_id(raw_id: Any) -> Optional[str]:
     return sid
 
 
+def normalize_search_text(text: str) -> str:
+    """
+    Нормализует текст для поиска:
+    - Убирает [ТВ-1], [ТВ-2] и т.д.
+    - Заменяет ё на е
+    - Убирает лишние пробелы
+    """
+    # Убираем части типа [ТВ-1], [ТВ-2], [OVA] и т.д.
+    text = re.sub(r'\s*\[.*?\]\s*', ' ', text)
+    
+    # Заменяем ё на е
+    text = text.replace('ё', 'е').replace('Ё', 'Е')
+    
+    # Убираем лишние пробелы
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+
 # ─────────────────────────────────────────────
 # 🔍 ПОИСК АНИМЕ
 # ─────────────────────────────────────────────
@@ -35,17 +55,27 @@ async def search_anime(title: str, limit: int = 12) -> List[Dict[str, Any]]:
     """
     parser = await get_parser()
 
+    # ✅ Нормализуем поисковый запрос
+    normalized_title = normalize_search_text(title)
+    print(f"🔍 Ищем: '{title}' → нормализовано: '{normalized_title}'")
+
     try:
+        # ✅ Убрали strict=True для более гибкого поиска
         results = await parser.search(
-            title=title,
-            limit=limit * 15,  # Берём с запасом для фильтрации
+            title=normalized_title,
+            limit=limit * 20,  # ✅ Увеличили запас для фильтрации
             only_anime=True,
             include_material_data=True,
-            strict=True  # 👈 Исключает далёкие от запроса результаты
+            strict=False  # ✅ Более гибкий поиск
         )
+
+        print(f"📊 Kodik вернул: {len(results)} результатов")
 
         # Группируем по shikimori_id
         grouped: Dict[str, Dict] = {}
+
+        # ✅ Нормализованный запрос для сравнения
+        search_words = set(normalized_title.lower().split())
 
         for item in results:
             shiki_id = normalize_shikimori_id(item.get("shikimori_id"))
@@ -58,29 +88,69 @@ async def search_anime(title: str, limit: int = 12) -> List[Dict[str, Any]]:
 
             material = item.get("material_data") or {}
             title_ru = item.get("title", "")
+            title_orig = material.get("title_orig", "")
             
             # Фильтруем очевидные дубликаты и неподходящие
             if not title_ru or len(title_ru) < 2:
                 continue
 
+            # ✅ Проверяем релевантность
+            # Нормализуем название аниме
+            normalized_anime_title = normalize_search_text(title_ru)
+            anime_words = set(normalized_anime_title.lower().split())
+            
+            # Проверяем также оригинальное название
+            if title_orig:
+                normalized_orig_title = normalize_search_text(title_orig)
+                anime_words.update(normalized_orig_title.lower().split())
+            
+            # Считаем совпадающие слова
+            matching_words = search_words.intersection(anime_words)
+            
+            # Если хотя бы 50% слов совпадают или это точное вхождение
+            relevance_ratio = len(matching_words) / len(search_words) if search_words else 0
+            
+            # ✅ Более мягкий фильтр релевантности
+            is_relevant = (
+                relevance_ratio >= 0.4 or  # 40% слов совпадают
+                normalized_title.lower() in normalized_anime_title.lower() or
+                normalized_anime_title.lower() in normalized_title.lower()
+            )
+            
+            if not is_relevant:
+                continue
+
             grouped[shiki_id] = {
                 "id": shiki_id,
                 "title": title_ru,
-                "title_orig": material.get("title_orig"),
+                "title_orig": title_orig,
                 "year": item.get("year"),
                 "type": item.get("type"),
                 "poster": item["screenshots"][0] if item.get("screenshots") else None,
                 "description": material.get("description"),
                 "genres": material.get("genres", []),
                 "status": material.get("status"),
-                "rating": material.get("shikimori_rating")
+                "rating": material.get("shikimori_rating"),
+                "_relevance": relevance_ratio  # Для отладки
             }
 
             if len(grouped) >= limit:
                 break
 
-        # Сортируем по релевантности (можно улучшить)
-        return list(grouped.values())[:limit]
+        # ✅ Сортируем по релевантности
+        sorted_results = sorted(
+            grouped.values(),
+            key=lambda x: x.get("_relevance", 0),
+            reverse=True
+        )
+        
+        # Убираем служебное поле
+        for r in sorted_results:
+            r.pop("_relevance", None)
+        
+        print(f"✅ Отфильтровано: {len(sorted_results)} релевантных результатов")
+
+        return sorted_results[:limit]
 
     except Exception as e:
         print(f"[KODIK SEARCH ERROR] {e}")
@@ -205,6 +275,7 @@ async def get_video_m3u8(
         print(f"[KODIK VIDEO ERROR] {e}")
         return None
     
+
 async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> Dict[str, Any]:
     """
     Получение аниме по жанру с ЛЕНИВОЙ загрузкой
