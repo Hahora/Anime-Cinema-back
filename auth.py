@@ -40,13 +40,9 @@ def get_password_hash(password: str) -> str:
     Хеширует пароль
     ВАЖНО: bcrypt ограничен 72 байтами
     """
-    # Проверяем размер в байтах
     password_bytes = password.encode('utf-8')
-    
     if len(password_bytes) > 72:
-        # Обрезаем до 72 байтов
         password_bytes = password_bytes[:72]
-        # Пытаемся декодировать, игнорируя неполные символы на конце
         password = password_bytes.decode('utf-8', errors='ignore')
     
     return pwd_context.hash(password)
