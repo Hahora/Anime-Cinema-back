@@ -40,12 +40,16 @@ def get_password_hash(password: str) -> str:
     Хеширует пароль
     ВАЖНО: bcrypt ограничен 72 байтами
     """
-    # Обрезаем пароль до 72 символов (bcrypt ограничение)
-    if len(password) > 72:
-        password = password[:72]
+    # Проверяем размер в байтах
+    password_bytes = password.encode('utf-8')
+    
+    if len(password_bytes) > 72:
+        # Обрезаем до 72 байтов
+        password_bytes = password_bytes[:72]
+        # Пытаемся декодировать, игнорируя неполные символы на конце
+        password = password_bytes.decode('utf-8', errors='ignore')
     
     return pwd_context.hash(password)
-
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """Создаёт JWT токен"""
