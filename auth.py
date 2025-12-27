@@ -19,11 +19,9 @@ ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 43200))
 ADMIN_REGISTRATION_KEY = os.getenv("ADMIN_REGISTRATION_KEY")
 
-# Для хеширования паролей (ИСПРАВЛЕНО)
 pwd_context = CryptContext(
-    schemes=["bcrypt"],
+    schemes=["argon2"], 
     deprecated="auto",
-    bcrypt__rounds=12  # Количество раундов хеширования
 )
 
 # Для получения токена из заголовка Authorization: Bearer <token>
@@ -37,15 +35,11 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 def get_password_hash(password: str) -> str:
     """
-    Хеширует пароль
-    ВАЖНО: bcrypt ограничен 72 байтами
+    Хеширует пароль с помощью Argon2
+    Argon2 НЕ ИМЕЕТ ограничения в 72 байта!
     """
-    password_bytes = password.encode('utf-8')
-    if len(password_bytes) > 72:
-        password_bytes = password_bytes[:72]
-        password = password_bytes.decode('utf-8', errors='ignore')
-    
     return pwd_context.hash(password)
+
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """Создаёт JWT токен"""
