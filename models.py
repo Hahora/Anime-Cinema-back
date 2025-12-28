@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, T
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database import Base
+from datetime import datetime 
 
 
 class User(Base):
@@ -157,4 +158,49 @@ class Notification(Base):
         Index('ix_notifications_is_read', 'is_read'),
         Index('ix_notifications_created_at', 'created_at'),
     )
+
+# ═══════════════════════════════════════════
+# ЧАТЫ И СООБЩЕНИЯ
+# ═══════════════════════════════════════════
+
+class Chat(Base):
+    __tablename__ = "chats"
     
+    id = Column(Integer, primary_key=True, index=True)
+    type = Column(String, default="private")  # private, group (на будущее)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Отношения
+    participants = relationship("ChatParticipant", back_populates="chat", cascade="all, delete-orphan")
+    messages = relationship("Message", back_populates="chat", cascade="all, delete-orphan")
+
+
+class ChatParticipant(Base):
+    __tablename__ = "chat_participants"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(Integer, ForeignKey("chats.id", ondelete="CASCADE"))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    joined_at = Column(DateTime, default=datetime.utcnow)
+    last_read_at = Column(DateTime, nullable=True)  # Для непрочитанных
+    
+    # Отношения
+    chat = relationship("Chat", back_populates="participants")
+    user = relationship("User")
+
+
+class Message(Base):
+    __tablename__ = "messages"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(Integer, ForeignKey("chats.id", ondelete="CASCADE"))
+    sender_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    is_edited = Column(Boolean, default=False)
+    edited_at = Column(DateTime, nullable=True)
+    
+    # Отношения
+    chat = relationship("Chat", back_populates="messages")
+    sender = relationship("User")

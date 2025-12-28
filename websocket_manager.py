@@ -99,11 +99,33 @@ async def disconnect(sid):
         print(f"❌ Ошибка отключения: {e}")
 
 
-# Отправка онлайн статуса друзьям
+@sio.event
+async def typing(sid, data):
+    """Обработка события 'печатает'"""
+    try:
+        # Находим user_id по session id
+        user_id = None
+        for uid, sessions in user_connections.items():
+            if sid in sessions:
+                user_id = uid
+                break
+        
+        if user_id and 'chat_id' in data:
+            chat_id = data['chat_id']
+            await send_typing_to_chat(chat_id, user_id)
+            print(f"⌨️ User {user_id} is typing in chat {chat_id}")
+    
+    except Exception as e:
+        print(f"❌ Ошибка обработки typing: {e}")
+
+
+# ═══════════════════════════════════════════
+# ONLINE STATUS
+# ═══════════════════════════════════════════
+
 async def broadcast_online_status(user_id: int, is_online: bool):
     """Уведомить друзей о смене онлайн статуса"""
     try:
-        # Импортируем здесь чтобы избежать циклических импортов
         from database import SessionLocal
         from models import Friendship
         from sqlalchemy import or_, and_
@@ -143,6 +165,29 @@ async def broadcast_online_status(user_id: int, is_online: bool):
         print(f"❌ Ошибка broadcast_online_status: {e}")
 
 
+def get_online_friends(friend_ids: list) -> list:
+    """Получить список ID друзей которые онлайн"""
+    return [fid for fid in friend_ids if fid in online_users]
+
+
+def is_user_online(user_id: int) -> bool:
+    """Проверить онлайн ли пользователь"""
+    return user_id in online_users
+
+
+def get_connection_stats():
+    """Получить статистику подключений"""
+    return {
+        "total_connections": sum(len(sessions) for sessions in user_connections.values()),
+        "unique_users": len(user_connections),
+        "online_users": len(online_users),
+        "connections_per_user": {
+            user_id: len(sessions) 
+            for user_id, sessions in user_connections.items()
+        }
+    }
+
+
 # ═══════════════════════════════════════════
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════
@@ -160,31 +205,6 @@ async def send_to_user(user_id: int, event: str, data: dict):
 async def send_notification_to_user(user_id: int, notification_data: dict):
     """Отправить уведомление пользователю через WebSocket"""
     await send_to_user(user_id, 'notification', notification_data)
-
-
-# Получить список онлайн друзей
-def get_online_friends(friend_ids: list) -> list:
-    """Получить список ID друзей которые онлайн"""
-    return [fid for fid in friend_ids if fid in online_users]
-
-
-# НОВАЯ ФУНКЦИЯ: Проверить онлайн ли пользователь
-def is_user_online(user_id: int) -> bool:
-    """Проверить онлайн ли пользователь"""
-    return user_id in online_users
-
-
-def get_connection_stats():
-    """Получить статистику подключений"""
-    return {
-        "total_connections": sum(len(sessions) for sessions in user_connections.values()),
-        "unique_users": len(user_connections),
-        "online_users": len(online_users),
-        "connections_per_user": {
-            user_id: len(sessions) 
-            for user_id, sessions in user_connections.items()
-        }
-    }
 
 
 # ═══════════════════════════════════════════
@@ -225,3 +245,64 @@ async def send_friend_rejected_notification(receiver_id: int, rejecter_name: str
         'sender_name': rejecter_name,
     }
     await send_notification_to_user(receiver_id, notification)
+
+
+# ═══════════════════════════════════════════
+# CHAT MESSAGES
+# ═══════════════════════════════════════════
+
+async def send_message_to_chat(chat_id: int, sender_id: int, message_data: dict):
+    """Отправить сообщение всем участникам чата через WebSocket"""
+    try:
+        from database import SessionLocal
+        from models import ChatParticipant
+        
+        db = SessionLocal()
+        
+        try:
+            # Получаем всех участников чата
+            participants = db.query(ChatParticipant).filter(
+                ChatParticipant.chat_id == chat_id
+            ).all()
+            
+            # Отправляем сообщение каждому участнику (кроме отправителя)
+            for participant in participants:
+                if participant.user_id != sender_id and participant.user_id in user_connections:
+                    await send_to_user(participant.user_id, 'new_message', message_data)
+            
+            print(f"💬 Message sent to chat {chat_id} from user {sender_id}")
+            
+        finally:
+            db.close()
+            
+    except Exception as e:
+        print(f"❌ Ошибка send_message_to_chat: {e}")
+
+
+async def send_typing_to_chat(chat_id: int, user_id: int):
+    """Отправить событие "печатает" участникам чата"""
+    try:
+        from database import SessionLocal
+        from models import ChatParticipant
+        
+        db = SessionLocal()
+        
+        try:
+            # Получаем всех участников чата
+            participants = db.query(ChatParticipant).filter(
+                ChatParticipant.chat_id == chat_id
+            ).all()
+            
+            # Отправляем событие каждому участнику (кроме отправителя)
+            for participant in participants:
+                if participant.user_id != user_id and participant.user_id in user_connections:
+                    await send_to_user(participant.user_id, 'user_typing', {
+                        'chat_id': chat_id,
+                        'user_id': user_id
+                    })
+            
+        finally:
+            db.close()
+            
+    except Exception as e:
+        print(f"❌ Ошибка send_typing_to_chat: {e}")

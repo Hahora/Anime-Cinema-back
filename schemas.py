@@ -246,3 +246,61 @@ class ChangePassword(BaseModel):
         if len(v) < 6:
             raise ValueError('Пароль должен быть не менее 6 символов')
         return v
+    
+# Добавьте в конец файла
+
+# ═══════════════════════════════════════════
+# ЧАТЫ И СООБЩЕНИЯ
+# ═══════════════════════════════════════════
+
+class MessageCreate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=5000)
+    
+    @validator('content')
+    def content_not_empty(cls, v):
+        if not v.strip():
+            raise ValueError('Сообщение не может быть пустым')
+        return v.strip()
+
+
+class MessageItem(BaseModel):
+    id: int
+    chat_id: int
+    sender_id: int
+    sender_name: str
+    sender_avatar: str
+    content: str
+    created_at: datetime
+    is_edited: bool
+    edited_at: Optional[datetime]
+    
+    class Config:
+        from_attributes = True
+
+
+class ChatItem(BaseModel):
+    id: int
+    type: str
+    created_at: datetime
+    updated_at: datetime
+    
+    # Информация о собеседнике (для приватных чатов)
+    other_user_id: Optional[int] = None
+    other_user_name: Optional[str] = None
+    other_user_username: Optional[str] = None
+    other_user_avatar: Optional[str] = None
+    
+    # Последнее сообщение
+    last_message: Optional[str] = None
+    last_message_time: Optional[datetime] = None
+    last_message_sender_id: Optional[int] = None
+    
+    # Непрочитанные
+    unread_count: int = 0
+    
+    class Config:
+        from_attributes = True
+
+
+class ChatCreate(BaseModel):
+    friend_id: int  

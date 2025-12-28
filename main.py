@@ -6,17 +6,19 @@ from sqlalchemy import text, or_, and_
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
 from typing import List, Optional
+from datetime import datetime 
 import socketio
 
 from database import get_db, init_db
-from models import User, Favorite, WatchedAnime, WatchHistory, Friendship, Notification  
+from models import User, Favorite, WatchedAnime, WatchHistory, Friendship, Notification, Chat, ChatParticipant, Message
 from schemas import (
     UserRegister, Token, UserProfile, UserProfileUpdate,
     FavoriteAdd, FavoriteItem,
     WatchedAnimeUpdate, WatchedAnimeItem,
     WatchHistoryAdd, WatchHistoryItem,
     UserShort, FriendshipCreate, FriendshipItem, FriendshipResponse, NotificationItem,
-    ChangeUsername, ChangePassword
+    ChangeUsername, ChangePassword,
+    ChatCreate, ChatItem, MessageCreate, MessageItem
 )
 from auth import (
     get_password_hash, verify_password, create_access_token,
@@ -1357,6 +1359,353 @@ async def get_friendship_status(
         }
     
     return {"status": "none"}
+
+# ═══════════════════════════════════════════
+# ЧАТЫ
+# ═══════════════════════════════════════════
+
+@app.get("/api/chats", response_model=List[ChatItem])
+async def get_chats(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Получить список чатов пользователя
+    """
+    # Получаем все чаты где пользователь участник
+    participants = db.query(ChatParticipant).filter(
+        ChatParticipant.user_id == current_user.id
+    ).all()
+    
+    chat_items = []
+    
+    for participant in participants:
+        chat = participant.chat
+        
+        # Получаем другого участника (для приватных чатов)
+        other_participant = db.query(ChatParticipant).filter(
+            ChatParticipant.chat_id == chat.id,
+            ChatParticipant.user_id != current_user.id
+        ).first()
+        
+        # Получаем последнее сообщение
+        last_message = db.query(Message).filter(
+            Message.chat_id == chat.id
+        ).order_by(Message.created_at.desc()).first()
+        
+        # Считаем непрочитанные
+        unread_count = 0
+        if participant.last_read_at:
+            unread_count = db.query(Message).filter(
+                Message.chat_id == chat.id,
+                Message.created_at > participant.last_read_at,
+                Message.sender_id != current_user.id
+            ).count()
+        else:
+            unread_count = db.query(Message).filter(
+                Message.chat_id == chat.id,
+                Message.sender_id != current_user.id
+            ).count()
+        
+        chat_item = {
+            "id": chat.id,
+            "type": chat.type,
+            "created_at": chat.created_at,
+            "updated_at": chat.updated_at,
+            "unread_count": unread_count
+        }
+        
+        # Добавляем информацию о собеседнике
+        if other_participant:
+            other_user = other_participant.user
+            chat_item.update({
+                "other_user_id": other_user.id,
+                "other_user_name": other_user.name,
+                "other_user_username": other_user.username,
+                "other_user_avatar": other_user.avatar_url
+            })
+        
+        # Добавляем последнее сообщение
+        if last_message:
+            chat_item.update({
+                "last_message": last_message.content,
+                "last_message_time": last_message.created_at,
+                "last_message_sender_id": last_message.sender_id
+            })
+        
+        chat_items.append(ChatItem(**chat_item))
+    
+    # Сортируем по времени последнего сообщения
+    chat_items.sort(key=lambda x: x.last_message_time or x.created_at, reverse=True)
+    
+    return chat_items
+
+
+@app.post("/api/chats", response_model=ChatItem)
+async def create_chat(
+    data: ChatCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Создать чат с другом
+    """
+    # Проверяем что это друзья
+    friendship = db.query(Friendship).filter(
+        or_(
+            and_(Friendship.user_id == current_user.id, Friendship.friend_id == data.friend_id),
+            and_(Friendship.user_id == data.friend_id, Friendship.friend_id == current_user.id)
+        ),
+        Friendship.status == "accepted"
+    ).first()
+    
+    if not friendship:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Вы можете создать чат только с друзьями"
+        )
+    
+    # Проверяем что чат не существует
+    existing_chat = db.query(Chat).join(ChatParticipant).filter(
+        ChatParticipant.user_id.in_([current_user.id, data.friend_id])
+    ).group_by(Chat.id).having(
+        func.count(ChatParticipant.id) == 2
+    ).first()
+    
+    if existing_chat:
+        # Возвращаем существующий чат
+        return await get_chat_item(existing_chat.id, current_user.id, db)
+    
+    # Создаем новый чат
+    new_chat = Chat(type="private")
+    db.add(new_chat)
+    db.commit()
+    db.refresh(new_chat)
+    
+    # Добавляем участников
+    participant1 = ChatParticipant(chat_id=new_chat.id, user_id=current_user.id)
+    participant2 = ChatParticipant(chat_id=new_chat.id, user_id=data.friend_id)
+    
+    db.add(participant1)
+    db.add(participant2)
+    db.commit()
+    
+    return await get_chat_item(new_chat.id, current_user.id, db)
+
+
+async def get_chat_item(chat_id: int, user_id: int, db: Session) -> ChatItem:
+    """Вспомогательная функция для получения ChatItem"""
+    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+    
+    # Получаем другого участника
+    other_participant = db.query(ChatParticipant).filter(
+        ChatParticipant.chat_id == chat_id,
+        ChatParticipant.user_id != user_id
+    ).first()
+    
+    # Получаем последнее сообщение
+    last_message = db.query(Message).filter(
+        Message.chat_id == chat_id
+    ).order_by(Message.created_at.desc()).first()
+    
+    # Получаем информацию о текущем участнике
+    current_participant = db.query(ChatParticipant).filter(
+        ChatParticipant.chat_id == chat_id,
+        ChatParticipant.user_id == user_id
+    ).first()
+    
+    # Считаем непрочитанные
+    unread_count = 0
+    if current_participant and current_participant.last_read_at:
+        unread_count = db.query(Message).filter(
+            Message.chat_id == chat_id,
+            Message.created_at > current_participant.last_read_at,
+            Message.sender_id != user_id
+        ).count()
+    else:
+        unread_count = db.query(Message).filter(
+            Message.chat_id == chat_id,
+            Message.sender_id != user_id
+        ).count()
+    
+    chat_item = {
+        "id": chat.id,
+        "type": chat.type,
+        "created_at": chat.created_at,
+        "updated_at": chat.updated_at,
+        "unread_count": unread_count
+    }
+    
+    if other_participant:
+        other_user = other_participant.user
+        chat_item.update({
+            "other_user_id": other_user.id,
+            "other_user_name": other_user.name,
+            "other_user_username": other_user.username,
+            "other_user_avatar": other_user.avatar_url
+        })
+    
+    if last_message:
+        chat_item.update({
+            "last_message": last_message.content,
+            "last_message_time": last_message.created_at,
+            "last_message_sender_id": last_message.sender_id
+        })
+    
+    return ChatItem(**chat_item)
+
+
+# ═══════════════════════════════════════════
+# СООБЩЕНИЯ
+# ═══════════════════════════════════════════
+
+@app.get("/api/chats/{chat_id}/messages", response_model=List[MessageItem])
+async def get_messages(
+    chat_id: int,
+    limit: int = 50,
+    before_id: Optional[int] = None,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Получить сообщения чата с пагинацией
+    """
+    # Проверяем что пользователь участник чата
+    participant = db.query(ChatParticipant).filter(
+        ChatParticipant.chat_id == chat_id,
+        ChatParticipant.user_id == current_user.id
+    ).first()
+    
+    if not participant:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Вы не являетесь участником этого чата"
+        )
+    
+    # Получаем сообщения
+    query = db.query(Message).filter(Message.chat_id == chat_id)
+    
+    if before_id:
+        query = query.filter(Message.id < before_id)
+    
+    messages = query.order_by(Message.created_at.desc()).limit(limit).all()
+    messages.reverse()  # Возвращаем в хронологическом порядке
+    
+    # Формируем ответ
+    result = []
+    for msg in messages:
+        result.append(MessageItem(
+            id=msg.id,
+            chat_id=msg.chat_id,
+            sender_id=msg.sender_id,
+            sender_name=msg.sender.name,
+            sender_avatar=msg.sender.avatar_url,
+            content=msg.content,
+            created_at=msg.created_at,
+            is_edited=msg.is_edited,
+            edited_at=msg.edited_at
+        ))
+    
+    return result
+
+
+@app.post("/api/chats/{chat_id}/messages", response_model=MessageItem)
+async def send_message(
+    chat_id: int,
+    data: MessageCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Отправить сообщение в чат
+    """
+    # Проверяем что пользователь участник чата
+    participant = db.query(ChatParticipant).filter(
+        ChatParticipant.chat_id == chat_id,
+        ChatParticipant.user_id == current_user.id
+    ).first()
+    
+    if not participant:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Вы не являетесь участником этого чата"
+        )
+    
+    # Создаем сообщение
+    new_message = Message(
+        chat_id=chat_id,
+        sender_id=current_user.id,
+        content=data.content
+    )
+    
+    db.add(new_message)
+    
+    # Обновляем время обновления чата
+    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+    chat.updated_at = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(new_message)
+    
+    # Формируем ответ
+    message_item = MessageItem(
+        id=new_message.id,
+        chat_id=new_message.chat_id,
+        sender_id=new_message.sender_id,
+        sender_name=current_user.name,
+        sender_avatar=current_user.avatar_url,
+        content=new_message.content,
+        created_at=new_message.created_at,
+        is_edited=new_message.is_edited,
+        edited_at=new_message.edited_at
+    )
+    
+    import asyncio
+    from websocket_manager import send_message_to_chat
+    
+    # Создаем словарь с конвертированными датами
+    ws_data = {
+        'id': message_item.id,
+        'chat_id': message_item.chat_id,
+        'sender_id': message_item.sender_id,
+        'sender_name': message_item.sender_name,
+        'sender_avatar': message_item.sender_avatar,
+        'content': message_item.content,
+        'created_at': message_item.created_at.isoformat(),  
+        'is_edited': message_item.is_edited,
+        'edited_at': message_item.edited_at.isoformat() if message_item.edited_at else None  
+    }
+    
+    # Используем asyncio для запуска в отдельной задаче
+    asyncio.create_task(send_message_to_chat(chat_id, current_user.id, ws_data))
+    
+    return message_item
+
+
+@app.put("/api/chats/{chat_id}/read")
+async def mark_chat_read(
+    chat_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Отметить все сообщения чата как прочитанные
+    """
+    participant = db.query(ChatParticipant).filter(
+        ChatParticipant.chat_id == chat_id,
+        ChatParticipant.user_id == current_user.id
+    ).first()
+    
+    if not participant:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Вы не являетесь участником этого чата"
+        )
+    
+    participant.last_read_at = datetime.utcnow()
+    db.commit()
+    
+    return {"message": "Сообщения отмечены как прочитанные"}
 
 # ═══════════════════════════════════════════
 # ERROR HANDLERS
