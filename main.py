@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.responses import JSONResponse 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import text
+from sqlalchemy import text, or_, and_
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
 from typing import List, Optional
@@ -15,7 +15,8 @@ from schemas import (
     FavoriteAdd, FavoriteItem,
     WatchedAnimeUpdate, WatchedAnimeItem,
     WatchHistoryAdd, WatchHistoryItem,
-    UserShort, FriendshipCreate, FriendshipItem, FriendshipResponse, NotificationItem
+    UserShort, FriendshipCreate, FriendshipItem, FriendshipResponse, NotificationItem,
+    ChangeUsername, ChangePassword
 )
 from auth import (
     get_password_hash, verify_password, create_access_token,
@@ -1060,6 +1061,81 @@ async def check_friendship(
         "friendship_id": friendship.id,
         "is_sender": friendship.user_id == current_user.id
     }
+
+# ═══════════════════════════════════════════
+# АВТОРИЗАЦИЯ - БЕЗОПАСНОСТЬ
+# ═══════════════════════════════════════════
+
+@app.put("/api/auth/change-username")
+async def change_username(
+    data: ChangeUsername,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Изменить логин пользователя
+    """
+    # Проверяем что новый username не занят
+    existing_user = db.query(User).filter(
+        User.username == data.new_username.lower(),
+        User.id != current_user.id
+    ).first()
+    
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Этот логин уже занят"
+        )
+    
+    # Обновляем username
+    current_user.username = data.new_username.lower()
+    db.commit()
+    
+    new_token = create_access_token(data={"sub": current_user.username})
+    
+    return {
+        "message": "Логин успешно изменён",
+        "new_username": current_user.username,
+        "access_token": new_token,  
+        "token_type": "bearer"
+    }
+
+
+@app.put("/api/auth/change-password")
+async def change_password(
+    data: ChangePassword,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Изменить пароль пользователя
+    """
+    # Проверяем старый пароль
+    if not verify_password(data.old_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Неверный старый пароль"
+        )
+    
+    # Проверяем что новый пароль не совпадает со старым
+    if verify_password(data.new_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Новый пароль должен отличаться от старого"
+        )
+    
+    # Проверяем длину нового пароля
+    if len(data.new_password) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Пароль должен быть не менее 6 символов"
+        )
+    
+    # Обновляем пароль
+    current_user.hashed_password = get_password_hash(data.new_password)
+    db.commit()
+    
+    return {"message": "Пароль успешно изменён"}
 
 # ═══════════════════════════════════════════
 # УВЕДОМЛЕНИЯ

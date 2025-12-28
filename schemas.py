@@ -218,3 +218,31 @@ class NotificationItem(BaseModel):
     
     class Config:
         from_attributes = True        
+
+# ═══════════════════════════════════════════
+# AUTH - БЕЗОПАСНОСТЬ
+# ═══════════════════════════════════════════
+
+class ChangeUsername(BaseModel):
+    new_username: str
+    
+    @validator('new_username')
+    def validate_username(cls, v):
+        if len(v) < 3:
+            raise ValueError('Логин должен быть не менее 3 символов')
+        if len(v) > 20:
+            raise ValueError('Логин должен быть не более 20 символов')
+        if not v.replace('_', '').replace('-', '').isalnum():
+            raise ValueError('Логин может содержать только буквы, цифры, _ и -')
+        return v.lower()
+
+
+class ChangePassword(BaseModel):
+    old_password: str
+    new_password: str
+    
+    @validator('new_password')
+    def validate_password(cls, v):
+        if len(v) < 6:
+            raise ValueError('Пароль должен быть не менее 6 символов')
+        return v
