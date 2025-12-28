@@ -1170,6 +1170,52 @@ async def check_friendship(
         "is_sender": friendship.user_id == current_user.id
     }
 
+@app.get("/api/friends/status/{user_id}")
+async def get_friendship_status(
+    user_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Получить статус дружбы с пользователем
+    Возвращает: self, none, pending_sent, pending_received, friends
+    """
+    # Если это свой профиль
+    if user_id == current_user.id:
+        return {"status": "self"}
+    
+    # Ищем дружбу в обе стороны
+    friendship = db.query(Friendship).filter(
+        ((Friendship.user_id == current_user.id) & (Friendship.friend_id == user_id)) |
+        ((Friendship.user_id == user_id) & (Friendship.friend_id == current_user.id))
+    ).first()
+    
+    # Если дружбы нет
+    if not friendship:
+        return {"status": "none"}
+    
+    # Если дружба принята
+    if friendship.status == "accepted":
+        return {
+            "status": "friends",
+            "friendship_id": friendship.id
+        }
+    
+    # Если заявка отправлена текущим пользователем
+    if friendship.user_id == current_user.id and friendship.status == "pending":
+        return {
+            "status": "pending_sent",
+            "friendship_id": friendship.id
+        }
+    
+    # Если заявка получена текущим пользователем
+    if friendship.friend_id == current_user.id and friendship.status == "pending":
+        return {
+            "status": "pending_received",
+            "friendship_id": friendship.id
+        }
+    
+    return {"status": "none"}
 
 # ═══════════════════════════════════════════
 # ERROR HANDLERS
