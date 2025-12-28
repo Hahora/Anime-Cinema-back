@@ -1,153 +1,131 @@
-from typing import Dict, Set
 import socketio
-from datetime import datetime
+from typing import Dict, Set
+import os
+from dotenv import load_dotenv
 
-# Создаём Socket.IO сервер
+load_dotenv()
+
+# ═══════════════════════════════════════════
+# SOCKETIO SERVER
+# ═══════════════════════════════════════════
 sio = socketio.AsyncServer(
     async_mode='asgi',
     cors_allowed_origins=[
+        os.getenv("FRONTEND_URL", "http://localhost:5173"),
         "http://localhost:5173",
-        "http://localhost:3000",
         "http://127.0.0.1:5173",
-        "http://127.0.0.1:3000"
     ],
     logger=True,
-    engineio_logger=False
+    engineio_logger=True
 )
 
-# Хранилище подключений: {user_id: set(session_ids)}
+# Хранение подключений: {user_id: set(session_ids)}
 user_connections: Dict[int, Set[str]] = {}
-
 
 # ═══════════════════════════════════════════
 # СОБЫТИЯ ПОДКЛЮЧЕНИЯ
 # ═══════════════════════════════════════════
-
 @sio.event
 async def connect(sid, environ, auth):
     """Подключение клиента"""
-    print(f"🔌 Client connected: {sid}")
+    print(f"🔌 Client connecting: {sid}")
     
-    # Проверяем авторизацию
     if not auth or 'user_id' not in auth:
-        print(f"❌ Unauthorized connection attempt: {sid}")
+        print(f"❌ Connection rejected: no user_id")
         return False
     
     user_id = auth['user_id']
     
-    # Добавляем в список подключений
+    # Добавляем сессию к пользователю
     if user_id not in user_connections:
         user_connections[user_id] = set()
     user_connections[user_id].add(sid)
     
     print(f"✅ User {user_id} connected (session: {sid})")
-    print(f"📊 Active connections for user {user_id}: {len(user_connections[user_id])}")
+    print(f"📊 Active connections: {len(user_connections)}")
     
-    # Отправляем приветствие
-    await sio.emit('connected', {
-        'message': 'Connected to notification server',
-        'user_id': user_id,
-        'timestamp': datetime.utcnow().isoformat()
-    }, room=sid)
+    return True
 
 
 @sio.event
 async def disconnect(sid):
     """Отключение клиента"""
-    print(f"🔌 Client disconnected: {sid}")
+    print(f"🔌 Client disconnecting: {sid}")
     
-    # Удаляем из всех списков
+    # Удаляем сессию из всех пользователей
     for user_id, sessions in list(user_connections.items()):
         if sid in sessions:
             sessions.remove(sid)
-            print(f"✅ Removed session {sid} from user {user_id}")
+            print(f"👋 User {user_id} disconnected (session: {sid})")
             
-            # Удаляем пользователя если нет активных сессий
+            # Если у пользователя не осталось сессий, удаляем его
             if not sessions:
                 del user_connections[user_id]
-                print(f"📊 No active sessions for user {user_id}")
+            break
+    
+    print(f"📊 Active connections: {len(user_connections)}")
 
 
 # ═══════════════════════════════════════════
 # ОТПРАВКА УВЕДОМЛЕНИЙ
 # ═══════════════════════════════════════════
-
 async def send_notification_to_user(user_id: int, notification_data: dict):
-    """
-    Отправить уведомление конкретному пользователю
-    """
+    """Отправить уведомление конкретному пользователю"""
     if user_id not in user_connections:
-        print(f"⚠️ User {user_id} not connected")
-        return False
+        print(f"⚠️ User {user_id} not connected, notification not sent")
+        return
     
     sessions = user_connections[user_id]
-    print(f"📬 Sending notification to user {user_id} ({len(sessions)} sessions)")
+    print(f"📤 Sending notification to user {user_id} ({len(sessions)} sessions)")
     
-    # Отправляем всем активным сессиям пользователя
     for session_id in sessions:
         try:
             await sio.emit('notification', notification_data, room=session_id)
             print(f"✅ Notification sent to session {session_id}")
         except Exception as e:
             print(f"❌ Failed to send to session {session_id}: {e}")
-    
-    return True
 
 
-async def send_friend_request_notification(receiver_id: int, sender_data: dict, notification_id: int):
-    """Уведомление о новой заявке в друзья"""
+async def send_friend_request_notification(receiver_id: int, sender_name: str, sender_id: int):
+    """Уведомление о заявке в друзья"""
     await send_notification_to_user(receiver_id, {
-        'id': notification_id,
         'type': 'friend_request',
-        'title': 'Новая заявка в друзья',
-        'message': f"{sender_data['name']} хочет добавить вас в друзья",
-        'sender_id': sender_data['id'],
-        'sender_name': sender_data['name'],
-        'sender_avatar': sender_data['avatar_url'],
-        'is_read': False,
-        'created_at': datetime.utcnow().isoformat()
+        'message': f'{sender_name} отправил вам заявку в друзья',
+        'sender_id': sender_id,
+        'sender_name': sender_name,
     })
 
 
-async def send_friend_accepted_notification(receiver_id: int, accepter_data: dict, notification_id: int):
+async def send_friend_accepted_notification(receiver_id: int, accepter_name: str, accepter_id: int):
     """Уведомление о принятии заявки"""
     await send_notification_to_user(receiver_id, {
-        'id': notification_id,
         'type': 'friend_accepted',
-        'title': 'Заявка принята',
-        'message': f"{accepter_data['name']} принял вашу заявку в друзья",
-        'sender_id': accepter_data['id'],
-        'sender_name': accepter_data['name'],
-        'sender_avatar': accepter_data['avatar_url'],
-        'is_read': False,
-        'created_at': datetime.utcnow().isoformat()
+        'message': f'{accepter_name} принял вашу заявку в друзья',
+        'accepter_id': accepter_id,
+        'accepter_name': accepter_name,
     })
 
 
-async def send_friend_rejected_notification(receiver_id: int, rejecter_data: dict, notification_id: int):
+async def send_friend_rejected_notification(receiver_id: int, rejecter_name: str, rejecter_id: int):
     """Уведомление об отклонении заявки"""
     await send_notification_to_user(receiver_id, {
-        'id': notification_id,
         'type': 'friend_rejected',
-        'title': 'Заявка отклонена',
-        'message': f"{rejecter_data['name']} отклонил вашу заявку в друзья",
-        'sender_id': rejecter_data['id'],
-        'sender_name': rejecter_data['name'],
-        'sender_avatar': rejecter_data['avatar_url'],
-        'is_read': False,
-        'created_at': datetime.utcnow().isoformat()
+        'message': f'{rejecter_name} отклонил вашу заявку в друзья',
+        'rejecter_id': rejecter_id,
+        'rejecter_name': rejecter_name,
     })
 
 
 # ═══════════════════════════════════════════
-# СТАТИСТИКА
+# СТАТИСТИКА ПОДКЛЮЧЕНИЙ
 # ═══════════════════════════════════════════
-
-def get_connected_users():
-    """Получить список подключенных пользователей"""
-    return list(user_connections.keys())
-
-
-def get_user_sessions(user_id: int):
-    """Получить количество активных сессий пользователя"""
-    return len(user_connections.get(user_id, set()))
+def get_connection_stats():
+    """Получить статистику подключений"""
+    return {
+        'total_users': len(user_connections),
+        'total_sessions': sum(len(sessions) for sessions in user_connections.values()),
+        'users': {
+            user_id: len(sessions)
+            for user_id, sessions in user_connections.items()
+        }
+    }

@@ -6,7 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
 from typing import List, Optional
-
+import socketio
 
 from database import get_db, init_db
 from models import User, Favorite, WatchedAnime, WatchHistory, Friendship, Notification  
@@ -31,6 +31,13 @@ from parsers.kodik_api import (
     get_anime_by_genre 
 )
 
+from websocket_manager import (
+    sio,
+    send_friend_request_notification,
+    send_friend_accepted_notification,
+    send_friend_rejected_notification,
+    get_connection_stats
+)
 
 # Создаём таблицы при запуске
 init_db()
@@ -38,7 +45,7 @@ init_db()
 app = FastAPI(
     title="Anime Cinema API",
     version="3.0.0",
-    description="API для просмотра аниме через Kodik с авторизацией"
+    description="API для просмотра аниме через Kodik с авторизацией и WebSocket уведомлениями"
 )
 
 # CORS
@@ -55,6 +62,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+socket_app = socketio.ASGIApp(
+    sio,
+    app,
+    socketio_path='/ws/socket.io'
+)
 
 # ═══════════════════════════════════════════
 # ROOT & HEALTH
@@ -67,7 +79,7 @@ async def root():
         "service": "Anime Cinema API",
         "version": "3.0.0",
         "database": "PostgreSQL",
-        "features": ["auth", "profiles", "favorites", "history"]
+        "features": ["auth", "profiles", "favorites", "history", "websocket"]
     }
 
 
@@ -85,15 +97,19 @@ async def health(db: Session = Depends(get_db)):
         }
 
 
+@app.get("/api/websocket/stats")
+async def websocket_stats(current_user: User = Depends(get_current_active_user)):
+    """Статистика WebSocket подключений"""
+    return get_connection_stats()
+
+
 # ═══════════════════════════════════════════
 # АВТОРИЗАЦИЯ
 # ═══════════════════════════════════════════
 
 @app.post("/api/auth/register", response_model=Token, status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserRegister, db: Session = Depends(get_db)):
-    """
-    Регистрация нового пользователя (только с админским ключом!)
-    """
+    """Регистрация нового пользователя (только с админским ключом!)"""
     if not verify_admin_key(user_data.admin_key):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -126,9 +142,7 @@ async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
-    """
-    Вход в систему
-    """
+    """Вход в систему"""
     user = db.query(User).filter(User.username == form_data.username.lower()).first()
     
     if not user or not verify_password(form_data.password, user.hashed_password):
@@ -768,22 +782,17 @@ async def get_friends(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Получить список друзей (только accepted)
-    """
-    # Друзья где я отправитель
+    """Получить список друзей (только accepted)"""
     sent_friendships = db.query(Friendship).filter(
         Friendship.user_id == current_user.id,
         Friendship.status == "accepted"
     ).all()
     
-    # Друзья где я получатель
     received_friendships = db.query(Friendship).filter(
         Friendship.friend_id == current_user.id,
         Friendship.status == "accepted"
     ).all()
     
-    # Формируем ответ
     result = []
     
     for fs in sent_friendships:
@@ -812,9 +821,7 @@ async def get_friend_requests(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Получить входящие заявки в друзья
-    """
+    """Получить входящие заявки в друзья"""
     requests = db.query(Friendship).filter(
         Friendship.friend_id == current_user.id,
         Friendship.status == "pending"
@@ -832,7 +839,6 @@ async def get_friend_requests(
     ]
 
 
-#эндпоинт добавления в друзья
 @app.post("/api/friends/add", response_model=FriendshipResponse, status_code=status.HTTP_201_CREATED)
 async def add_friend(
     data: FriendshipCreate,
@@ -880,6 +886,7 @@ async def add_friend(
     db.commit()
     db.refresh(friendship)
     
+    # ✅ Создаём уведомление в БД
     notification = Notification(
         user_id=data.friend_id,
         type="friend_request",
@@ -892,6 +899,13 @@ async def add_friend(
     db.add(notification)
     db.commit()
     
+    # ✅ Отправляем WebSocket уведомление
+    await send_friend_request_notification(
+        receiver_id=data.friend_id,
+        sender_name=current_user.name,
+        sender_id=current_user.id
+    )
+    
     return FriendshipResponse(
         id=friendship.id,
         status=friendship.status,
@@ -899,7 +913,6 @@ async def add_friend(
         friend=friendship.friend,
         created_at=friendship.created_at
     )
-
 
 
 @app.put("/api/friends/accept/{friendship_id}", response_model=FriendshipResponse)
@@ -927,9 +940,9 @@ async def accept_friend_request(
     db.commit()
     db.refresh(friendship)
     
-    # ✅ Создаём уведомление отправителю
+    # ✅ Создаём уведомление в БД
     notification = Notification(
-        user_id=friendship.user_id,  # Отправителю заявки
+        user_id=friendship.user_id,
         type="friend_accepted",
         title="Заявка принята",
         message=f"{current_user.name} принял вашу заявку в друзья",
@@ -940,6 +953,13 @@ async def accept_friend_request(
     db.add(notification)
     db.commit()
     
+    # ✅ Отправляем WebSocket уведомление
+    await send_friend_accepted_notification(
+        receiver_id=friendship.user_id,
+        accepter_name=current_user.name,
+        accepter_id=current_user.id
+    )
+    
     return FriendshipResponse(
         id=friendship.id,
         status=friendship.status,
@@ -947,6 +967,103 @@ async def accept_friend_request(
         friend=friendship.friend,
         created_at=friendship.created_at
     )
+
+
+@app.put("/api/friends/reject/{friendship_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def reject_friend_request(
+    friendship_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Отклонить заявку в друзья"""
+    friendship = db.query(Friendship).filter(
+        Friendship.id == friendship_id,
+        Friendship.friend_id == current_user.id,
+        Friendship.status == "pending"
+    ).first()
+    
+    if not friendship:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Заявка не найдена"
+        )
+    
+    # ✅ Создаём уведомление в БД
+    notification = Notification(
+        user_id=friendship.user_id,
+        type="friend_rejected",
+        title="Заявка отклонена",
+        message=f"{current_user.name} отклонил вашу заявку в друзья",
+        sender_id=current_user.id,
+        sender_name=current_user.name,
+        sender_avatar=current_user.avatar_url
+    )
+    db.add(notification)
+    
+    # ✅ Отправляем WebSocket уведомление
+    await send_friend_rejected_notification(
+        receiver_id=friendship.user_id,
+        rejecter_name=current_user.name,
+        rejecter_id=current_user.id
+    )
+    
+    # Удаляем заявку
+    db.delete(friendship)
+    db.commit()
+
+
+@app.delete("/api/friends/{friendship_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_friend(
+    friendship_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Удалить из друзей"""
+    friendship = db.query(Friendship).filter(
+        Friendship.id == friendship_id,
+        ((Friendship.user_id == current_user.id) | (Friendship.friend_id == current_user.id))
+    ).first()
+    
+    if not friendship:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Дружба не найдена"
+        )
+    
+    db.delete(friendship)
+    db.commit()
+
+
+@app.get("/api/friends/check/{user_id}")
+async def check_friendship(
+    user_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Проверить статус дружбы с пользователем"""
+    friendship = db.query(Friendship).filter(
+        ((Friendship.user_id == current_user.id) & (Friendship.friend_id == user_id)) |
+        ((Friendship.user_id == user_id) & (Friendship.friend_id == current_user.id))
+    ).first()
+    
+    if not friendship:
+        return {
+            "is_friend": False,
+            "status": None,
+            "friendship_id": None,
+            "is_sender": False
+        }
+    
+    return {
+        "is_friend": friendship.status == "accepted",
+        "status": friendship.status,
+        "friendship_id": friendship.id,
+        "is_sender": friendship.user_id == current_user.id
+    }
+
+# ═══════════════════════════════════════════
+# УВЕДОМЛЕНИЯ
+# ═══════════════════════════════════════════
 
 @app.get("/api/notifications/unread")
 async def get_unread_notifications_count(
@@ -1099,7 +1216,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "main:app",
+        "main:socket_app",  
         host="0.0.0.0",
         port=8000,
         reload=True,
