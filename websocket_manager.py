@@ -10,7 +10,7 @@ load_dotenv()
 # ═══════════════════════════════════════════
 sio = socketio.AsyncServer(
     async_mode='asgi',
-     cors_allowed_origins=[
+    cors_allowed_origins=[
         "https://m2-live.store",
         "http://m2-live.store",
         "http://localhost:5173",
@@ -18,116 +18,210 @@ sio = socketio.AsyncServer(
     ],
     logger=True,
     engineio_logger=True,
-    allow_upgrades=True
+    allow_upgrades=True,
 )
 
-# Хранение подключений: {user_id: set(session_ids)}
+# Хранилище подключений: user_id -> set of session_ids
 user_connections: Dict[int, Set[str]] = {}
 
+# Хранилище онлайн статусов: user_id -> timestamp последней активности
+online_users: Dict[int, float] = {}
+
 # ═══════════════════════════════════════════
-# СОБЫТИЯ ПОДКЛЮЧЕНИЯ
+# SOCKET EVENTS
 # ═══════════════════════════════════════════
+
 @sio.event
 async def connect(sid, environ, auth):
     """Подключение клиента"""
-    print(f"🔌 Client connecting: {sid}")
-    
-    if not auth or 'user_id' not in auth:
-        print(f"❌ Connection rejected: no user_id")
+    try:
+        user_id = auth.get('user_id') if auth else None
+        
+        if not user_id:
+            print(f"⚠️ Отклонено подключение {sid}: user_id не указан")
+            return False
+        
+        user_id = int(user_id)
+        
+        # Добавляем соединение
+        if user_id not in user_connections:
+            user_connections[user_id] = set()
+        user_connections[user_id].add(sid)
+        
+        # Отмечаем пользователя онлайн
+        import time
+        online_users[user_id] = time.time()
+        
+        print(f"✅ Пользователь {user_id} подключён (session: {sid})")
+        print(f"📊 Всего подключений: {sum(len(sessions) for sessions in user_connections.values())}")
+        print(f"🟢 Онлайн пользователей: {len(online_users)}")
+        
+        # Уведомляем друзей что пользователь онлайн
+        await broadcast_online_status(user_id, True)
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Ошибка подключения: {e}")
         return False
-    
-    user_id = auth['user_id']
-    
-    # Добавляем сессию к пользователю
-    if user_id not in user_connections:
-        user_connections[user_id] = set()
-    user_connections[user_id].add(sid)
-    
-    print(f"✅ User {user_id} connected (session: {sid})")
-    print(f"📊 Active connections: {len(user_connections)}")
-    
-    return True
 
 
 @sio.event
 async def disconnect(sid):
     """Отключение клиента"""
-    print(f"🔌 Client disconnecting: {sid}")
-    
-    # Удаляем сессию из всех пользователей
-    for user_id, sessions in list(user_connections.items()):
-        if sid in sessions:
-            sessions.remove(sid)
-            print(f"👋 User {user_id} disconnected (session: {sid})")
+    try:
+        # Находим пользователя по session id
+        user_id = None
+        for uid, sessions in user_connections.items():
+            if sid in sessions:
+                user_id = uid
+                sessions.remove(sid)
+                
+                # Если у пользователя не осталось подключений
+                if not sessions:
+                    del user_connections[uid]
+                    # Удаляем из онлайна
+                    if uid in online_users:
+                        del online_users[uid]
+                    # Уведомляем друзей что пользователь офлайн
+                    await broadcast_online_status(uid, False)
+                
+                break
+        
+        if user_id:
+            print(f"🔌 Пользователь {user_id} отключён (session: {sid})")
+            print(f"📊 Осталось подключений: {sum(len(sessions) for sessions in user_connections.values())}")
+            print(f"🟢 Онлайн пользователей: {len(online_users)}")
+        else:
+            print(f"⚠️ Отключение неизвестной сессии: {sid}")
             
-            # Если у пользователя не осталось сессий, удаляем его
-            if not sessions:
-                del user_connections[user_id]
-            break
-    
-    print(f"📊 Active connections: {len(user_connections)}")
+    except Exception as e:
+        print(f"❌ Ошибка отключения: {e}")
 
 
-# ═══════════════════════════════════════════
-# ОТПРАВКА УВЕДОМЛЕНИЙ
-# ═══════════════════════════════════════════
-async def send_notification_to_user(user_id: int, notification_data: dict):
-    """Отправить уведомление конкретному пользователю"""
-    if user_id not in user_connections:
-        print(f"⚠️ User {user_id} not connected, notification not sent")
-        return
-    
-    sessions = user_connections[user_id]
-    print(f"📤 Sending notification to user {user_id} ({len(sessions)} sessions)")
-    
-    for session_id in sessions:
+# Отправка онлайн статуса друзьям
+async def broadcast_online_status(user_id: int, is_online: bool):
+    """Уведомить друзей о смене онлайн статуса"""
+    try:
+        # Импортируем здесь чтобы избежать циклических импортов
+        from database import SessionLocal
+        from models import Friendship
+        from sqlalchemy import or_, and_
+        
+        db = SessionLocal()
+        
         try:
-            await sio.emit('notification', notification_data, room=session_id)
-            print(f"✅ Notification sent to session {session_id}")
-        except Exception as e:
-            print(f"❌ Failed to send to session {session_id}: {e}")
-
-
-async def send_friend_request_notification(receiver_id: int, sender_name: str, sender_id: int):
-    """Уведомление о заявке в друзья"""
-    await send_notification_to_user(receiver_id, {
-        'type': 'friend_request',
-        'message': f'{sender_name} отправил вам заявку в друзья',
-        'sender_id': sender_id,
-        'sender_name': sender_name,
-    })
-
-
-async def send_friend_accepted_notification(receiver_id: int, accepter_name: str, accepter_id: int):
-    """Уведомление о принятии заявки"""
-    await send_notification_to_user(receiver_id, {
-        'type': 'friend_accepted',
-        'message': f'{accepter_name} принял вашу заявку в друзья',
-        'accepter_id': accepter_id,
-        'accepter_name': accepter_name,
-    })
-
-
-async def send_friend_rejected_notification(receiver_id: int, rejecter_name: str, rejecter_id: int):
-    """Уведомление об отклонении заявки"""
-    await send_notification_to_user(receiver_id, {
-        'type': 'friend_rejected',
-        'message': f'{rejecter_name} отклонил вашу заявку в друзья',
-        'rejecter_id': rejecter_id,
-        'rejecter_name': rejecter_name,
-    })
+            # Находим всех друзей пользователя
+            friendships = db.query(Friendship).filter(
+                or_(
+                    and_(Friendship.user_id == user_id, Friendship.status == "accepted"),
+                    and_(Friendship.friend_id == user_id, Friendship.status == "accepted")
+                )
+            ).all()
+            
+            friend_ids = set()
+            for fs in friendships:
+                if fs.user_id == user_id:
+                    friend_ids.add(fs.friend_id)
+                else:
+                    friend_ids.add(fs.user_id)
+            
+            # Отправляем уведомление каждому онлайн другу
+            for friend_id in friend_ids:
+                if friend_id in user_connections:
+                    await send_to_user(friend_id, 'user_online_status', {
+                        'user_id': user_id,
+                        'is_online': is_online
+                    })
+            
+            print(f"📡 Отправлен статус {'🟢 онлайн' if is_online else '⚪ офлайн'} для пользователя {user_id} ({len(friend_ids)} друзей)")
+            
+        finally:
+            db.close()
+            
+    except Exception as e:
+        print(f"❌ Ошибка broadcast_online_status: {e}")
 
 
 # ═══════════════════════════════════════════
-# СТАТИСТИКА ПОДКЛЮЧЕНИЙ
+# HELPER FUNCTIONS
 # ═══════════════════════════════════════════
+
+async def send_to_user(user_id: int, event: str, data: dict):
+    """Отправить событие конкретному пользователю"""
+    if user_id in user_connections:
+        for session_id in user_connections[user_id]:
+            try:
+                await sio.emit(event, data, room=session_id)
+            except Exception as e:
+                print(f"❌ Ошибка отправки {event} пользователю {user_id}: {e}")
+
+
+async def send_notification_to_user(user_id: int, notification_data: dict):
+    """Отправить уведомление пользователю через WebSocket"""
+    await send_to_user(user_id, 'notification', notification_data)
+
+
+# Получить список онлайн друзей
+def get_online_friends(friend_ids: list) -> list:
+    """Получить список ID друзей которые онлайн"""
+    return [fid for fid in friend_ids if fid in online_users]
+
+
+# НОВАЯ ФУНКЦИЯ: Проверить онлайн ли пользователь
+def is_user_online(user_id: int) -> bool:
+    """Проверить онлайн ли пользователь"""
+    return user_id in online_users
+
+
 def get_connection_stats():
     """Получить статистику подключений"""
     return {
-        'total_users': len(user_connections),
-        'total_sessions': sum(len(sessions) for sessions in user_connections.values()),
-        'users': {
-            user_id: len(sessions)
+        "total_connections": sum(len(sessions) for sessions in user_connections.values()),
+        "unique_users": len(user_connections),
+        "online_users": len(online_users),
+        "connections_per_user": {
+            user_id: len(sessions) 
             for user_id, sessions in user_connections.items()
         }
     }
+
+
+# ═══════════════════════════════════════════
+# FRIEND NOTIFICATIONS
+# ═══════════════════════════════════════════
+
+async def send_friend_request_notification(receiver_id: int, sender_name: str, sender_id: int):
+    """Отправить уведомление о заявке в друзья"""
+    notification = {
+        'type': 'friend_request',
+        'title': 'Новая заявка в друзья',
+        'message': f'{sender_name} хочет добавить вас в друзья',
+        'sender_id': sender_id,
+        'sender_name': sender_name,
+    }
+    await send_notification_to_user(receiver_id, notification)
+
+
+async def send_friend_accepted_notification(receiver_id: int, accepter_name: str, accepter_id: int):
+    """Отправить уведомление о принятии заявки"""
+    notification = {
+        'type': 'friend_accepted',
+        'title': 'Заявка принята',
+        'message': f'{accepter_name} принял вашу заявку в друзья',
+        'sender_id': accepter_id,
+        'sender_name': accepter_name,
+    }
+    await send_notification_to_user(receiver_id, notification)
+
+
+async def send_friend_rejected_notification(receiver_id: int, rejecter_name: str, rejecter_id: int):
+    """Отправить уведомление об отклонении заявки"""
+    notification = {
+        'type': 'friend_rejected',
+        'title': 'Заявка отклонена',
+        'message': f'{rejecter_name} отклонил вашу заявку в друзья',
+        'sender_id': rejecter_id,
+        'sender_name': rejecter_name,
+    }
+    await send_notification_to_user(receiver_id, notification)

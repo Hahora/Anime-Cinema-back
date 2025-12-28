@@ -1138,6 +1138,71 @@ async def change_password(
     return {"message": "Пароль успешно изменён"}
 
 # ═══════════════════════════════════════════
+# ONLINE STATUS
+# ═══════════════════════════════════════════
+
+@app.get("/api/users/online")
+async def get_online_users(
+    current_user: User = Depends(get_current_active_user)
+):
+    """Получить список онлайн пользователей"""
+    from websocket_manager import online_users
+    
+    return {
+        "online_user_ids": list(online_users.keys()),
+        "count": len(online_users)
+    }
+
+
+@app.get("/api/friends/online")
+async def get_online_friends_list(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Получить список онлайн друзей"""
+    from websocket_manager import get_online_friends
+    
+    # Получаем всех друзей
+    sent_friendships = db.query(Friendship).filter(
+        Friendship.user_id == current_user.id,
+        Friendship.status == "accepted"
+    ).all()
+    
+    received_friendships = db.query(Friendship).filter(
+        Friendship.friend_id == current_user.id,
+        Friendship.status == "accepted"
+    ).all()
+    
+    friend_ids = []
+    for fs in sent_friendships:
+        friend_ids.append(fs.friend_id)
+    for fs in received_friendships:
+        friend_ids.append(fs.user_id)
+    
+    # Получаем онлайн друзей
+    online_friend_ids = get_online_friends(friend_ids)
+    
+    return {
+        "online_friend_ids": online_friend_ids,
+        "total_friends": len(friend_ids),
+        "online_count": len(online_friend_ids)
+    }
+
+
+@app.get("/api/users/{user_id}/online")
+async def check_user_online(
+    user_id: int,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Проверить онлайн ли пользователь"""
+    from websocket_manager import is_user_online
+    
+    return {
+        "user_id": user_id,
+        "is_online": is_user_online(user_id)
+    }
+
+# ═══════════════════════════════════════════
 # УВЕДОМЛЕНИЯ
 # ═══════════════════════════════════════════
 
