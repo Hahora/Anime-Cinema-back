@@ -10,13 +10,15 @@ load_dotenv()
 # ═══════════════════════════════════════════
 sio = socketio.AsyncServer(
     async_mode='asgi',
-    cors_allowed_origins=[
-        os.getenv("FRONTEND_URL", "http://localhost:5173"),
+     cors_allowed_origins=[
+        "https://m2-live.store",
+        "http://m2-live.store",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
     logger=True,
-    engineio_logger=True
+    engineio_logger=True,
+    allow_upgrades=True
 )
 
 # Хранение подключений: {user_id: set(session_ids)}
