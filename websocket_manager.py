@@ -2,6 +2,7 @@ import socketio
 from typing import Dict, Set
 import os
 from dotenv import load_dotenv
+from datetime import datetime 
 
 load_dotenv()
 
@@ -306,3 +307,134 @@ async def send_typing_to_chat(chat_id: int, user_id: int):
             
     except Exception as e:
         print(f"❌ Ошибка send_typing_to_chat: {e}")
+
+async def send_read_receipt(chat_id: int, reader_id: int):
+    """Отправить уведомление о прочтении сообщений"""
+    try:
+        from database import SessionLocal
+        from models import ChatParticipant
+        
+        print(f"\n📨 send_read_receipt вызвана:")
+        print(f"   chat_id: {chat_id}")
+        print(f"   reader_id: {reader_id}")
+        
+        db = SessionLocal()
+        
+        try:
+            # Получаем всех участников чата
+            participants = db.query(ChatParticipant).filter(
+                ChatParticipant.chat_id == chat_id
+            ).all()
+            
+            print(f"   Участников в чате: {len(participants)}")
+            
+            event_data = {
+                'chat_id': chat_id,
+                'user_id': reader_id,
+                'read_at': datetime.now().isoformat()
+            }
+            
+            sent_count = 0
+            for participant in participants:
+                print(f"   Участник: user_id={participant.user_id}, онлайн={participant.user_id in user_connections}")
+                
+                if participant.user_id in user_connections:
+                    await send_to_user(participant.user_id, 'message_read', event_data)
+                    sent_count += 1
+                    print(f"   ✅ Отправлено пользователю {participant.user_id}")
+                else:
+                    print(f"   ⚠️ Пользователь {participant.user_id} не в сети")
+            
+            print(f"   📊 Всего отправлено: {sent_count}")
+            print(f"✓✓ Read receipt обработан для чата {chat_id}\n")
+            
+        finally:
+            db.close()
+            
+    except Exception as e:
+        print(f"❌ Ошибка send_read_receipt: {e}")
+        import traceback
+        traceback.print_exc()
+
+async def send_message_edited(chat_id: int, editor_id: int, message_data: dict):
+    """Отправить уведомление о редактировании сообщения"""
+    try:
+        from database import SessionLocal
+        from models import ChatParticipant
+        
+        print(f"\n✏️ send_message_edited вызвана:")
+        print(f"   chat_id: {chat_id}")
+        print(f"   editor_id: {editor_id}")
+        print(f"   message_id: {message_data.get('id')}")
+        
+        db = SessionLocal()
+        
+        try:
+            # Получаем всех участников чата
+            participants = db.query(ChatParticipant).filter(
+                ChatParticipant.chat_id == chat_id
+            ).all()
+            
+            # Отправляем событие каждому участнику (включая редактора для синхронизации)
+            sent_count = 0
+            for participant in participants:
+                if participant.user_id in user_connections:
+                    await send_to_user(participant.user_id, 'message_edited', message_data)
+                    sent_count += 1
+                    print(f"   ✅ Отправлено пользователю {participant.user_id}")
+            
+            print(f"   📊 Всего отправлено: {sent_count}")
+            print(f"✏️ Message edited notification sent\n")
+            
+        finally:
+            db.close()
+            
+    except Exception as e:
+        print(f"❌ Ошибка send_message_edited: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def send_message_deleted(chat_id: int, message_id: int, deleter_id: int):
+    """Отправить уведомление об удалении сообщения"""
+    try:
+        from database import SessionLocal
+        from models import ChatParticipant
+        
+        print(f"\n🗑️ send_message_deleted вызвана:")
+        print(f"   chat_id: {chat_id}")
+        print(f"   message_id: {message_id}")
+        print(f"   deleter_id: {deleter_id}")
+        
+        db = SessionLocal()
+        
+        try:
+            # Получаем всех участников чата
+            participants = db.query(ChatParticipant).filter(
+                ChatParticipant.chat_id == chat_id
+            ).all()
+            
+            event_data = {
+                'chat_id': chat_id,
+                'message_id': message_id,
+                'deleted_by': deleter_id
+            }
+            
+            # Отправляем событие каждому участнику (включая удалившего для синхронизации)
+            sent_count = 0
+            for participant in participants:
+                if participant.user_id in user_connections:
+                    await send_to_user(participant.user_id, 'message_deleted', event_data)
+                    sent_count += 1
+                    print(f"   ✅ Отправлено пользователю {participant.user_id}")
+            
+            print(f"   📊 Всего отправлено: {sent_count}")
+            print(f"🗑️ Message deleted notification sent\n")
+            
+        finally:
+            db.close()
+            
+    except Exception as e:
+        print(f"❌ Ошибка send_message_deleted: {e}")
+        import traceback
+        traceback.print_exc()

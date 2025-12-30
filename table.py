@@ -1,14 +1,12 @@
 from database import engine
-from models import Chat, ChatParticipant, Message
+from models import Message
 
-# Создаём таблицы чатов и сообщений
-Chat.__table__.create(bind=engine, checkfirst=True)
-print("✅ Таблица chats создана!")
+# Удаляем старую таблицу
+Message.__table__.drop(bind=engine, checkfirst=True)
+print("🗑️  Таблица messages удалена!")
 
-ChatParticipant.__table__.create(bind=engine, checkfirst=True)
-print("✅ Таблица chat_participants создана!")
-
+# Создаём новую с is_read
 Message.__table__.create(bind=engine, checkfirst=True)
-print("✅ Таблица messages создана!")
+print("✅ Таблица messages создана с полем is_read!")
 
-print("\n🎉 Все таблицы для чатов успешно созданы!")
+print("\n🎉 Таблица messages обновлена!")

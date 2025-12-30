@@ -273,6 +273,7 @@ class MessageItem(BaseModel):
     created_at: datetime
     is_edited: bool
     edited_at: Optional[datetime]
+    is_read: bool = False 
     
     class Config:
         from_attributes = True

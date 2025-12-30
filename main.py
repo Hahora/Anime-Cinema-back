@@ -6,11 +6,11 @@ from sqlalchemy import text, or_, and_
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
 from typing import List, Optional
-from datetime import datetime 
+from datetime import datetime, timedelta
 import socketio
 
 from database import get_db, init_db
-from models import User, Favorite, WatchedAnime, WatchHistory, Friendship, Notification, Chat, ChatParticipant, Message
+from models import User, Favorite, WatchedAnime, WatchHistory, Friendship, Notification, Chat, ChatParticipant, Message, MessageEditHistory
 from schemas import (
     UserRegister, Token, UserProfile, UserProfileUpdate,
     FavoriteAdd, FavoriteItem,
@@ -67,7 +67,8 @@ app.add_middleware(
 
 socket_app = socketio.ASGIApp(
     sio,
-    app
+    app,
+    socketio_path='/ws/socket.io'
 )
 
 # ═══════════════════════════════════════════
@@ -1369,11 +1370,12 @@ async def get_chats(
     db: Session = Depends(get_db)
 ):
     """
-    Получить список чатов пользователя
+    Получить список чатов (только НЕ удалённые)
+    ✅ Последнее сообщение учитывает restored_at
     """
-    # Получаем все чаты где пользователь участник
     participants = db.query(ChatParticipant).filter(
-        ChatParticipant.user_id == current_user.id
+        ChatParticipant.user_id == current_user.id,
+        ChatParticipant.deleted_at == None  # Только НЕ удалённые
     ).all()
     
     chat_items = []
@@ -1381,30 +1383,45 @@ async def get_chats(
     for participant in participants:
         chat = participant.chat
         
-        # Получаем другого участника (для приватных чатов)
         other_participant = db.query(ChatParticipant).filter(
             ChatParticipant.chat_id == chat.id,
             ChatParticipant.user_id != current_user.id
         ).first()
         
-        # Получаем последнее сообщение
-        last_message = db.query(Message).filter(
-            Message.chat_id == chat.id
-        ).order_by(Message.created_at.desc()).first()
+        # ✅ Получаем последнее сообщение С УЧЁТОМ restored_at
+        last_message_query = db.query(Message).filter(
+            Message.chat_id == chat.id,
+            Message.deleted_at == None
+        )
         
-        # Считаем непрочитанные
-        unread_count = 0
+        # Если чат был восстановлен - показываем только новые сообщения
+        if participant.restored_at:
+            last_message_query = last_message_query.filter(
+                Message.created_at >= participant.restored_at
+            )
+        
+        last_message = last_message_query.order_by(
+            Message.created_at.desc()
+        ).first()
+        
+        # ✅ Считаем непрочитанные С УЧЁТОМ restored_at
+        unread_query = db.query(Message).filter(
+            Message.chat_id == chat.id,
+            Message.sender_id != current_user.id,
+            Message.deleted_at == None
+        )
+        
+        if participant.restored_at:
+            unread_query = unread_query.filter(
+                Message.created_at >= participant.restored_at
+            )
+        
         if participant.last_read_at:
-            unread_count = db.query(Message).filter(
-                Message.chat_id == chat.id,
-                Message.created_at > participant.last_read_at,
-                Message.sender_id != current_user.id
+            unread_count = unread_query.filter(
+                Message.created_at > participant.last_read_at
             ).count()
         else:
-            unread_count = db.query(Message).filter(
-                Message.chat_id == chat.id,
-                Message.sender_id != current_user.id
-            ).count()
+            unread_count = unread_query.count()
         
         chat_item = {
             "id": chat.id,
@@ -1414,7 +1431,6 @@ async def get_chats(
             "unread_count": unread_count
         }
         
-        # Добавляем информацию о собеседнике
         if other_participant:
             other_user = other_participant.user
             chat_item.update({
@@ -1424,7 +1440,6 @@ async def get_chats(
                 "other_user_avatar": other_user.avatar_url
             })
         
-        # Добавляем последнее сообщение
         if last_message:
             chat_item.update({
                 "last_message": last_message.content,
@@ -1434,7 +1449,6 @@ async def get_chats(
         
         chat_items.append(ChatItem(**chat_item))
     
-    # Сортируем по времени последнего сообщения
     chat_items.sort(key=lambda x: x.last_message_time or x.created_at, reverse=True)
     
     return chat_items
@@ -1447,7 +1461,7 @@ async def create_chat(
     db: Session = Depends(get_db)
 ):
     """
-    Создать чат с другом
+    Создать чат с другом (или восстановить удалённый)
     """
     # Проверяем что это друзья
     friendship = db.query(Friendship).filter(
@@ -1464,18 +1478,29 @@ async def create_chat(
             detail="Вы можете создать чат только с друзьями"
         )
     
-    # Проверяем что чат не существует
-    existing_chat = db.query(Chat).join(ChatParticipant).filter(
-        ChatParticipant.user_id.in_([current_user.id, data.friend_id])
-    ).group_by(Chat.id).having(
-        func.count(ChatParticipant.id) == 2
-    ).first()
+    # ✅ Ищем существующий чат (даже если удалён)
+    existing_participant = db.query(ChatParticipant).filter(
+        ChatParticipant.user_id == current_user.id
+    ).all()
     
-    if existing_chat:
-        # Возвращаем существующий чат
-        return await get_chat_item(existing_chat.id, current_user.id, db)
+    for part in existing_participant:
+        # Проверяем есть ли в этом чате второй участник
+        other = db.query(ChatParticipant).filter(
+            ChatParticipant.chat_id == part.chat_id,
+            ChatParticipant.user_id == data.friend_id
+        ).first()
+        
+        if other:
+            # Чат существует - восстанавливаем для обоих
+            part.deleted_at = None
+            other.deleted_at = None
+            db.commit()
+            
+            print(f"🔄 Чат {part.chat_id} восстановлен для пользователей {current_user.id} и {data.friend_id}")
+            
+            return await get_chat_item(part.chat_id, current_user.id, db)
     
-    # Создаем новый чат
+    # Чата нет - создаём новый
     new_chat = Chat(type="private")
     db.add(new_chat)
     db.commit()
@@ -1489,6 +1514,8 @@ async def create_chat(
     db.add(participant2)
     db.commit()
     
+    print(f"✅ Создан новый чат {new_chat.id}")
+    
     return await get_chat_item(new_chat.id, current_user.id, db)
 
 
@@ -1496,36 +1523,49 @@ async def get_chat_item(chat_id: int, user_id: int, db: Session) -> ChatItem:
     """Вспомогательная функция для получения ChatItem"""
     chat = db.query(Chat).filter(Chat.id == chat_id).first()
     
-    # Получаем другого участника
     other_participant = db.query(ChatParticipant).filter(
         ChatParticipant.chat_id == chat_id,
         ChatParticipant.user_id != user_id
     ).first()
     
-    # Получаем последнее сообщение
-    last_message = db.query(Message).filter(
-        Message.chat_id == chat_id
-    ).order_by(Message.created_at.desc()).first()
-    
-    # Получаем информацию о текущем участнике
     current_participant = db.query(ChatParticipant).filter(
         ChatParticipant.chat_id == chat_id,
         ChatParticipant.user_id == user_id
     ).first()
     
-    # Считаем непрочитанные
-    unread_count = 0
+    # ✅ Получаем последнее сообщение С УЧЁТОМ restored_at
+    last_message_query = db.query(Message).filter(
+        Message.chat_id == chat_id,
+        Message.deleted_at == None
+    )
+    
+    if current_participant and current_participant.restored_at:
+        last_message_query = last_message_query.filter(
+            Message.created_at >= current_participant.restored_at
+        )
+    
+    last_message = last_message_query.order_by(
+        Message.created_at.desc()
+    ).first()
+    
+    # ✅ Считаем непрочитанные С УЧЁТОМ restored_at
+    unread_query = db.query(Message).filter(
+        Message.chat_id == chat_id,
+        Message.sender_id != user_id,
+        Message.deleted_at == None
+    )
+    
+    if current_participant and current_participant.restored_at:
+        unread_query = unread_query.filter(
+            Message.created_at >= current_participant.restored_at
+        )
+    
     if current_participant and current_participant.last_read_at:
-        unread_count = db.query(Message).filter(
-            Message.chat_id == chat_id,
-            Message.created_at > current_participant.last_read_at,
-            Message.sender_id != user_id
+        unread_count = unread_query.filter(
+            Message.created_at > current_participant.last_read_at
         ).count()
     else:
-        unread_count = db.query(Message).filter(
-            Message.chat_id == chat_id,
-            Message.sender_id != user_id
-        ).count()
+        unread_count = unread_query.count()
     
     chat_item = {
         "id": chat.id,
@@ -1567,30 +1607,33 @@ async def get_messages(
     db: Session = Depends(get_db)
 ):
     """
-    Получить сообщения чата с пагинацией
+    Получить сообщения чата
+    ✅ Показываем только сообщения ПОСЛЕ последнего восстановления
     """
-    # Проверяем что пользователь участник чата
     participant = db.query(ChatParticipant).filter(
         ChatParticipant.chat_id == chat_id,
         ChatParticipant.user_id == current_user.id
     ).first()
     
     if not participant:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Вы не являетесь участником этого чата"
-        )
+        raise HTTPException(403, "Вы не являетесь участником этого чата")
     
-    # Получаем сообщения
-    query = db.query(Message).filter(Message.chat_id == chat_id)
+    query = db.query(Message).filter(
+        Message.chat_id == chat_id,
+        Message.deleted_at == None  # Не показываем удалённые
+    )
+    
+    # ✅ КЛЮЧЕВАЯ ЛОГИКА: Если чат был восстановлен - показываем только НОВЫЕ сообщения
+    if participant.restored_at:
+        query = query.filter(Message.created_at >= participant.restored_at)
+        print(f"📅 Показываем сообщения после {participant.restored_at}")
     
     if before_id:
         query = query.filter(Message.id < before_id)
     
     messages = query.order_by(Message.created_at.desc()).limit(limit).all()
-    messages.reverse()  # Возвращаем в хронологическом порядке
+    messages.reverse()
     
-    # Формируем ответ
     result = []
     for msg in messages:
         result.append(MessageItem(
@@ -1602,11 +1645,11 @@ async def get_messages(
             content=msg.content,
             created_at=msg.created_at,
             is_edited=msg.is_edited,
-            edited_at=msg.edited_at
+            edited_at=msg.edited_at,
+            is_read=msg.is_read
         ))
     
     return result
-
 
 @app.post("/api/chats/{chat_id}/messages", response_model=MessageItem)
 async def send_message(
@@ -1616,37 +1659,49 @@ async def send_message(
     db: Session = Depends(get_db)
 ):
     """
-    Отправить сообщение в чат
+    Отправить сообщение
+    ✅ Автоматически восстанавливает чат с чистого листа
     """
-    # Проверяем что пользователь участник чата
     participant = db.query(ChatParticipant).filter(
         ChatParticipant.chat_id == chat_id,
         ChatParticipant.user_id == current_user.id
     ).first()
     
     if not participant:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Вы не являетесь участником этого чата"
-        )
+        raise HTTPException(403, "Вы не являетесь участником этого чата")
     
-    # Создаем сообщение
+    # ✅ ВОССТАНАВЛИВАЕМ ЧАТ ДЛЯ ОБОИХ УЧАСТНИКОВ
+    all_participants = db.query(ChatParticipant).filter(
+        ChatParticipant.chat_id == chat_id
+    ).all()
+    
+    current_time = datetime.utcnow()
+    
+    for p in all_participants:
+        if p.deleted_at is not None:
+            # ✅ Сохраняем МОМЕНТ ВОССТАНОВЛЕНИЯ
+            # Все сообщения ДО этого момента останутся скрытыми
+            p.restored_at = current_time
+            p.deleted_at = None
+            print(f"🔄 Чат {chat_id} восстановлен для {p.user_id} с момента {current_time}")
+            print(f"   Старые сообщения ДО {current_time} будут скрыты")
+    
+    # Создаём новое сообщение
     new_message = Message(
         chat_id=chat_id,
         sender_id=current_user.id,
-        content=data.content
+        content=data.content,
+        original_content=data.content
     )
     
     db.add(new_message)
     
-    # Обновляем время обновления чата
     chat = db.query(Chat).filter(Chat.id == chat_id).first()
     chat.updated_at = datetime.utcnow()
     
     db.commit()
     db.refresh(new_message)
     
-    # Формируем ответ
     message_item = MessageItem(
         id=new_message.id,
         chat_id=new_message.chat_id,
@@ -1656,13 +1711,13 @@ async def send_message(
         content=new_message.content,
         created_at=new_message.created_at,
         is_edited=new_message.is_edited,
-        edited_at=new_message.edited_at
+        edited_at=new_message.edited_at,
+        is_read=False
     )
     
     import asyncio
     from websocket_manager import send_message_to_chat
     
-    # Создаем словарь с конвертированными датами
     ws_data = {
         'id': message_item.id,
         'chat_id': message_item.chat_id,
@@ -1670,16 +1725,15 @@ async def send_message(
         'sender_name': message_item.sender_name,
         'sender_avatar': message_item.sender_avatar,
         'content': message_item.content,
-        'created_at': message_item.created_at.isoformat(),  
+        'created_at': message_item.created_at.isoformat(),
         'is_edited': message_item.is_edited,
-        'edited_at': message_item.edited_at.isoformat() if message_item.edited_at else None  
+        'edited_at': message_item.edited_at.isoformat() if message_item.edited_at else None,
+        'is_read': False
     }
     
-    # Используем asyncio для запуска в отдельной задаче
     asyncio.create_task(send_message_to_chat(chat_id, current_user.id, ws_data))
     
     return message_item
-
 
 @app.put("/api/chats/{chat_id}/read")
 async def mark_chat_read(
@@ -1701,11 +1755,176 @@ async def mark_chat_read(
             detail="Вы не являетесь участником этого чата"
         )
     
+    # Обновляем last_read_at
     participant.last_read_at = datetime.utcnow()
+    
+    db.query(Message).filter(
+        Message.chat_id == chat_id,
+        Message.sender_id != current_user.id,
+        Message.is_read == False
+    ).update({"is_read": True})
+    
     db.commit()
+    
+    import asyncio
+    from websocket_manager import send_read_receipt
+    asyncio.create_task(send_read_receipt(chat_id, current_user.id))
     
     return {"message": "Сообщения отмечены как прочитанные"}
 
+# ═══════════════════════════════════════════
+# РЕДАКТИРОВАНИЕ И УДАЛЕНИЕ СООБЩЕНИЙ
+# ═══════════════════════════════════════════
+
+@app.put("/api/chats/{chat_id}/messages/{message_id}", response_model=MessageItem)
+async def edit_message(
+    chat_id: int,
+    message_id: int,
+    data: MessageCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Редактировать сообщение
+    ✅ Сохраняем ВСЮ историю изменений в отдельной таблице
+    """
+    message = db.query(Message).filter(
+        Message.id == message_id,
+        Message.chat_id == chat_id
+    ).first()
+    
+    if not message:
+        raise HTTPException(404, "Сообщение не найдено")
+    
+    if message.sender_id != current_user.id:
+        raise HTTPException(403, "Вы можете редактировать только свои сообщения")
+    
+    # Проверка 24 часов
+    time_passed = datetime.utcnow() - message.created_at
+    if time_passed > timedelta(hours=24):
+        raise HTTPException(403, "Прошло больше 24 часов. Редактирование недоступно.")
+    
+    # ✅ Сохраняем старую версию в историю
+    edit_record = MessageEditHistory(
+        message_id=message.id,
+        old_content=message.content,
+        new_content=data.content,
+        edited_by=current_user.id
+    )
+    db.add(edit_record)
+    
+    # ✅ Обновляем сообщение (original_content НЕ трогаем!)
+    message.content = data.content  # Новый текст
+    message.is_edited = True
+    message.edited_at = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(message)
+    
+    message_item = MessageItem(
+        id=message.id,
+        chat_id=message.chat_id,
+        sender_id=message.sender_id,
+        sender_name=current_user.name,
+        sender_avatar=current_user.avatar_url,
+        content=message.content,
+        created_at=message.created_at,
+        is_edited=message.is_edited,
+        edited_at=message.edited_at,
+        is_read=message.is_read
+    )
+    
+    # WebSocket
+    import asyncio
+    from websocket_manager import send_message_edited
+    
+    ws_data = {
+        'id': message_item.id,
+        'chat_id': message_item.chat_id,
+        'sender_id': message_item.sender_id,
+        'sender_name': message_item.sender_name,
+        'sender_avatar': message_item.sender_avatar,
+        'content': message_item.content,
+        'created_at': message_item.created_at.isoformat(),
+        'is_edited': message_item.is_edited,
+        'edited_at': message_item.edited_at.isoformat() if message_item.edited_at else None,
+        'is_read': message_item.is_read
+    }
+    
+    asyncio.create_task(send_message_edited(chat_id, current_user.id, ws_data))
+    
+    return message_item
+
+
+@app.delete("/api/chats/{chat_id}/messages/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_message(
+    chat_id: int,
+    message_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    "Удалить" сообщение (на самом деле просто скрываем)
+    ✅ Сообщение остаётся в БД для правоохранительных органов
+    """
+    message = db.query(Message).filter(
+        Message.id == message_id,
+        Message.chat_id == chat_id
+    ).first()
+    
+    if not message:
+        raise HTTPException(404, "Сообщение не найдено")
+    
+    if message.sender_id != current_user.id:
+        raise HTTPException(403, "Вы можете удалять только свои сообщения")
+    
+    # Проверка 24 часов
+    time_passed = datetime.utcnow() - message.created_at
+    if time_passed > timedelta(hours=24):
+        raise HTTPException(403, "Прошло больше 24 часов. Удаление недоступно.")
+    
+    # ✅ НЕ удаляем, только помечаем
+    message.deleted_at = datetime.utcnow()
+    message.deleted_by = current_user.id
+    
+    db.commit()
+    
+    print(f"👁️ Сообщение {message_id} скрыто (НЕ удалено из БД)")
+    
+    # WebSocket
+    import asyncio
+    from websocket_manager import send_message_deleted
+    asyncio.create_task(send_message_deleted(chat_id, message_id, current_user.id))
+
+
+@app.delete("/api/chats/{chat_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_chat(
+    chat_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Удалить чат для пользователя
+    ✅ Помечаем как удалённый (данные остаются в БД)
+    ✅ При восстановлении старые сообщения будут скрыты
+    """
+    participant = db.query(ChatParticipant).filter(
+        ChatParticipant.chat_id == chat_id,
+        ChatParticipant.user_id == current_user.id
+    ).first()
+    
+    if not participant:
+        raise HTTPException(403, "Вы не являетесь участником этого чата")
+    
+    # ✅ Помечаем как удалённый
+    participant.deleted_at = datetime.utcnow()
+    
+    # ✅ restored_at НЕ трогаем - он сохраняется для следующего восстановления
+    
+    db.commit()
+    
+    print(f"🗑️ Чат {chat_id} удалён для пользователя {current_user.id}")
+    print(f"   При восстановлении будут видны только новые сообщения")
 # ═══════════════════════════════════════════
 # ERROR HANDLERS
 # ═══════════════════════════════════════════
