@@ -19,8 +19,8 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     
     # Профиль
-    avatar_url = Column(String(500), default="https://i.pravatar.cc/300")
-    cover_url = Column(String(500), default="https://images.unsplash.com/photo-1578632767115-351597cf2477?w=1200")
+    avatar_url = Column(String(500), default="/static/images/avatar.webp")
+    cover_url = Column(String(500), default="/static/images/cover.webp")
     bio = Column(Text, default="Любитель аниме 🎌")
     
     # Служебные поля

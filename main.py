@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.responses import JSONResponse 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text, or_, and_
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
@@ -50,6 +51,8 @@ app = FastAPI(
     version="3.0.0",
     description="API для просмотра аниме через Kodik с авторизацией и WebSocket уведомлениями"
 )
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # CORS
 app.add_middleware(
