@@ -87,8 +87,15 @@ async def root():
         "database": "PostgreSQL",
         "features": ["auth", "profiles", "favorites", "history", "websocket"]
     }
-
-
+@app.get("/api/debug/privacy/{user_id}")
+async def debug_privacy(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    return {
+        "username": user.username,
+        "message_privacy": user.message_privacy,
+        "is_null": user.message_privacy is None,
+        "effective": user.message_privacy or "all"
+    }
 @app.get("/api/health")
 async def health(db: Session = Depends(get_db)):
     """Проверка работоспособности"""
@@ -178,7 +185,12 @@ async def get_my_profile(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Получение профиля текущего пользователя"""
+    """
+    Получение профиля текущего пользователя
+    ✅ Теперь возвращает message_privacy
+    """
+    from sqlalchemy import func
+    
     stats = db.query(
         func.count(WatchedAnime.id).label('total'),
         func.coalesce(func.sum(WatchedAnime.episodes_watched), 0).label('episodes')
@@ -198,6 +210,7 @@ async def get_my_profile(
         cover_url=current_user.cover_url,
         bio=current_user.bio,
         created_at=current_user.created_at,
+        message_privacy=current_user.message_privacy or "all",
         total_anime=stats.total or 0,
         total_episodes=int(stats.episodes),
         total_hours=total_hours,
@@ -211,13 +224,14 @@ async def update_profile(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Обновление профиля"""
+    # Обновляем только переданные поля
     for key, value in profile_data.dict(exclude_unset=True).items():
         setattr(current_user, key, value)
     
     db.commit()
     db.refresh(current_user)
     
+    # Возвращаем обновленный профиль
     return await get_my_profile(current_user, db)
 
 # Добавьте этот эндпоинт после /api/profile/me
@@ -1193,6 +1207,21 @@ async def get_online_friends_list(
         "online_count": len(online_friend_ids)
     }
 
+@app.get("/api/users/{user_id}/can-message")
+async def check_can_message(
+    user_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Проверить, может ли текущий пользователь написать сообщение другому пользователю
+    """
+    can_send, reason = await can_send_message_to_user(current_user.id, user_id, db)
+    
+    return {
+        "can_message": can_send,
+        "reason": reason if not can_send else None
+    }
 
 @app.get("/api/users/{user_id}/online")
 async def check_user_online(
@@ -1367,6 +1396,62 @@ async def get_friendship_status(
 # ЧАТЫ
 # ═══════════════════════════════════════════
 
+async def can_send_message_to_user(sender_id: int, receiver_id: int, db: Session) -> tuple[bool, str]:
+    """
+    Проверяет, может ли sender отправить сообщение receiver
+    ✅ ВЗАИМНАЯ БЛОКИРОВКА - проверяем настройки ОБОИХ пользователей
+    
+    Returns:
+        (bool, str): (Можно отправить?, Причина отказа)
+    """
+
+    sender = db.query(User).filter(User.id == sender_id).first()
+    if not sender:
+        return False, "Ошибка: отправитель не найден"
+    
+    sender_privacy = sender.message_privacy or "all"
+    
+    # Если отправитель отключил отправку сообщений
+    if sender_privacy == "nobody":
+        return False, "Вы отключили возможность отправки сообщений в настройках"
+    
+    receiver = db.query(User).filter(User.id == receiver_id).first()
+    if not receiver:
+        return False, "Пользователь не найден"
+    
+    receiver_privacy = receiver.message_privacy or "all"
+    
+    # Если получатель отключил получение сообщений
+    if receiver_privacy == "nobody":
+        return False, "Пользователь запретил получать сообщения"
+    
+    
+    # Нужна ли проверка дружбы?
+    needs_friendship_check = (
+        sender_privacy == "friends_only" or 
+        receiver_privacy == "friends_only"
+    )
+    
+    if needs_friendship_check:
+        friendship = db.query(Friendship).filter(
+            or_(
+                and_(Friendship.user_id == sender_id, Friendship.friend_id == receiver_id),
+                and_(Friendship.user_id == receiver_id, Friendship.friend_id == sender_id)
+            ),
+            Friendship.status == "accepted"
+        ).first()
+        
+        if not friendship:
+            # Определяем причину
+            if sender_privacy == "friends_only" and receiver_privacy == "friends_only":
+                return False, "Вы оба принимаете сообщения только от друзей. Добавьте друг друга в друзья."
+            elif sender_privacy == "friends_only":
+                return False, "Вы можете отправлять сообщения только друзьям"
+            else:  # receiver_privacy == "friends_only"
+                return False, "Пользователь принимает сообщения только от друзей"
+    
+    return True, ""
+
 @app.get("/api/chats", response_model=List[ChatItem])
 async def get_chats(
     current_user: User = Depends(get_current_active_user),
@@ -1465,7 +1550,16 @@ async def create_chat(
 ):
     """
     Создать чат с другом (или восстановить удалённый)
+    ✅ Проверяет настройки приватности
     """
+    # ✅ ПРОВЕРКА ПРИВАТНОСТИ
+    can_send, reason = await can_send_message_to_user(current_user.id, data.friend_id, db)
+    if not can_send:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=reason
+        )
+    
     # Проверяем что это друзья
     friendship = db.query(Friendship).filter(
         or_(
@@ -1552,6 +1646,8 @@ async def get_chat_item(chat_id: int, user_id: int, db: Session) -> ChatItem:
     ).first()
     
     # ✅ Считаем непрочитанные С УЧЁТОМ restored_at
+    from sqlalchemy import func, desc
+    
     unread_query = db.query(Message).filter(
         Message.chat_id == chat_id,
         Message.sender_id != user_id,
@@ -1663,6 +1759,7 @@ async def send_message(
 ):
     """
     Отправить сообщение
+    ✅ Проверяет настройки приватности получателя
     ✅ Автоматически восстанавливает чат с чистого листа
     """
     participant = db.query(ChatParticipant).filter(
@@ -1672,6 +1769,23 @@ async def send_message(
     
     if not participant:
         raise HTTPException(403, "Вы не являетесь участником этого чата")
+    
+    # ✅ ПОЛУЧАЕМ ID ПОЛУЧАТЕЛЯ
+    other_participant = db.query(ChatParticipant).filter(
+        ChatParticipant.chat_id == chat_id,
+        ChatParticipant.user_id != current_user.id
+    ).first()
+    
+    if not other_participant:
+        raise HTTPException(404, "Получатель не найден")
+    
+    # ✅ ПРОВЕРКА ПРИВАТНОСТИ
+    can_send, reason = await can_send_message_to_user(current_user.id, other_participant.user_id, db)
+    if not can_send:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=reason
+        )
     
     # ✅ ВОССТАНАВЛИВАЕМ ЧАТ ДЛЯ ОБОИХ УЧАСТНИКОВ
     all_participants = db.query(ChatParticipant).filter(
@@ -1737,7 +1851,7 @@ async def send_message(
     asyncio.create_task(send_message_to_chat(chat_id, current_user.id, ws_data))
     
     return message_item
-
+    
 @app.put("/api/chats/{chat_id}/read")
 async def mark_chat_read(
     chat_id: int,

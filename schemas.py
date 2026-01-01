@@ -57,6 +57,9 @@ class UserProfile(BaseModel):
     bio: str
     created_at: datetime
     
+    # ✅ Настройки приватности
+    message_privacy: str = "all"  # all, friends_only, nobody
+    
     # Статистика
     total_anime: int = 0
     total_episodes: int = 0
@@ -73,6 +76,14 @@ class UserProfileUpdate(BaseModel):
     avatar_url: Optional[str] = None
     cover_url: Optional[str] = None
     bio: Optional[str] = None
+    message_privacy: Optional[str] = None  # ✅ Добавлено
+    
+    @validator('message_privacy')
+    def validate_message_privacy(cls, v):
+        """Проверка допустимых значений"""
+        if v and v not in ['all', 'friends_only', 'nobody']:
+            raise ValueError('message_privacy должен быть: all, friends_only или nobody')
+        return v
 
 
 # ═══════════════════════════════════════════
@@ -304,4 +315,4 @@ class ChatItem(BaseModel):
 
 
 class ChatCreate(BaseModel):
-    friend_id: int  
+    friend_id: int

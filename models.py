@@ -23,6 +23,9 @@ class User(Base):
     cover_url = Column(String(500), default="/static/images/cover.webp")
     bio = Column(Text, default="Любитель аниме 🎌")
     
+    # ✅ Настройки приватности
+    message_privacy = Column(String(20), default="all")  # all, friends_only, nobody
+    
     # Служебные поля
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     is_active = Column(Boolean, default=True)
