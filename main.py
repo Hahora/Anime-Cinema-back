@@ -1399,40 +1399,30 @@ async def get_friendship_status(
 async def can_send_message_to_user(sender_id: int, receiver_id: int, db: Session) -> tuple[bool, str]:
     """
     Проверяет, может ли sender отправить сообщение receiver
-    ✅ ВЗАИМНАЯ БЛОКИРОВКА - проверяем настройки ОБОИХ пользователей
+    
+    ✅ ВАЖНО: message_privacy контролирует КТО МОЖЕТ ПИСАТЬ МНЕ, а не кому я могу писать!
+    
+    Проверяем ТОЛЬКО настройки ПОЛУЧАТЕЛЯ!
     
     Returns:
         (bool, str): (Можно отправить?, Причина отказа)
     """
-
-    sender = db.query(User).filter(User.id == sender_id).first()
-    if not sender:
-        return False, "Ошибка: отправитель не найден"
     
-    sender_privacy = sender.message_privacy or "all"
-    
-    # Если отправитель отключил отправку сообщений
-    if sender_privacy == "nobody":
-        return False, "Вы отключили возможность отправки сообщений в настройках"
-    
+    # ════════════════════════════════════════════════════════════════
+    # ПРОВЕРЯЕМ ТОЛЬКО ПОЛУЧАТЕЛЯ
+    # ════════════════════════════════════════════════════════════════
     receiver = db.query(User).filter(User.id == receiver_id).first()
     if not receiver:
         return False, "Пользователь не найден"
     
     receiver_privacy = receiver.message_privacy or "all"
     
-    # Если получатель отключил получение сообщений
+    # ✅ Если получатель запретил ВСЕМ писать
     if receiver_privacy == "nobody":
         return False, "Пользователь запретил получать сообщения"
     
-    
-    # Нужна ли проверка дружбы?
-    needs_friendship_check = (
-        sender_privacy == "friends_only" or 
-        receiver_privacy == "friends_only"
-    )
-    
-    if needs_friendship_check:
+    # ✅ Если получатель принимает ТОЛЬКО от друзей
+    if receiver_privacy == "friends_only":
         friendship = db.query(Friendship).filter(
             or_(
                 and_(Friendship.user_id == sender_id, Friendship.friend_id == receiver_id),
@@ -1442,14 +1432,9 @@ async def can_send_message_to_user(sender_id: int, receiver_id: int, db: Session
         ).first()
         
         if not friendship:
-            # Определяем причину
-            if sender_privacy == "friends_only" and receiver_privacy == "friends_only":
-                return False, "Вы оба принимаете сообщения только от друзей. Добавьте друг друга в друзья."
-            elif sender_privacy == "friends_only":
-                return False, "Вы можете отправлять сообщения только друзьям"
-            else:  # receiver_privacy == "friends_only"
-                return False, "Пользователь принимает сообщения только от друзей"
+            return False, "Пользователь принимает сообщения только от друзей"
     
+    # ✅ Всё ок (receiver_privacy == "all" или это друзья)
     return True, ""
 
 @app.get("/api/chats", response_model=List[ChatItem])
@@ -1549,10 +1534,14 @@ async def create_chat(
     db: Session = Depends(get_db)
 ):
     """
-    Создать чат с другом (или восстановить удалённый)
-    ✅ Проверяет настройки приватности
+    Создать чат с пользователем
+    ✅ НЕ восстанавливает удалённые чаты
+    ✅ Всегда создаёт НОВЫЙ чат
     """
+    
+    # ════════════════════════════════════════════════════════════════
     # ✅ ПРОВЕРКА ПРИВАТНОСТИ
+    # ════════════════════════════════════════════════════════════════
     can_send, reason = await can_send_message_to_user(current_user.id, data.friend_id, db)
     if not can_send:
         raise HTTPException(
@@ -1560,44 +1549,30 @@ async def create_chat(
             detail=reason
         )
     
-    # Проверяем что это друзья
-    friendship = db.query(Friendship).filter(
-        or_(
-            and_(Friendship.user_id == current_user.id, Friendship.friend_id == data.friend_id),
-            and_(Friendship.user_id == data.friend_id, Friendship.friend_id == current_user.id)
-        ),
-        Friendship.status == "accepted"
-    ).first()
-    
-    if not friendship:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Вы можете создать чат только с друзьями"
-        )
-    
-    # ✅ Ищем существующий чат (даже если удалён)
+    # ════════════════════════════════════════════════════════════════
+    # ✅ ИЩЕМ ТОЛЬКО НЕ УДАЛЁННЫЕ ЧАТЫ
+    # ════════════════════════════════════════════════════════════════
     existing_participant = db.query(ChatParticipant).filter(
-        ChatParticipant.user_id == current_user.id
+        ChatParticipant.user_id == current_user.id,
+        ChatParticipant.deleted_at == None  # ✅ ТОЛЬКО НЕ УДАЛЁННЫЕ!
     ).all()
     
     for part in existing_participant:
         # Проверяем есть ли в этом чате второй участник
         other = db.query(ChatParticipant).filter(
             ChatParticipant.chat_id == part.chat_id,
-            ChatParticipant.user_id == data.friend_id
+            ChatParticipant.user_id == data.friend_id,
+            ChatParticipant.deleted_at == None  # ✅ И У НЕГО ТОЖЕ НЕ УДАЛЁН!
         ).first()
         
         if other:
-            # Чат существует - восстанавливаем для обоих
-            part.deleted_at = None
-            other.deleted_at = None
-            db.commit()
-            
-            print(f"🔄 Чат {part.chat_id} восстановлен для пользователей {current_user.id} и {data.friend_id}")
-            
+            # ✅ Чат уже существует и НЕ удалён
+            print(f"✅ Чат {part.chat_id} уже существует")
             return await get_chat_item(part.chat_id, current_user.id, db)
     
-    # Чата нет - создаём новый
+    # ════════════════════════════════════════════════════════════════
+    # ✅ ВСЕГДА СОЗДАЁМ НОВЫЙ ЧАТ (удалённые НЕ восстанавливаем)
+    # ════════════════════════════════════════════════════════════════
     new_chat = Chat(type="private")
     db.add(new_chat)
     db.commit()
@@ -1612,7 +1587,6 @@ async def create_chat(
     db.commit()
     
     print(f"✅ Создан новый чат {new_chat.id}")
-    
     return await get_chat_item(new_chat.id, current_user.id, db)
 
 
@@ -1759,8 +1733,8 @@ async def send_message(
 ):
     """
     Отправить сообщение
-    ✅ Проверяет настройки приватности получателя
     ✅ Автоматически восстанавливает чат с чистого листа
+    ✅ НЕ проверяет приватность (чат уже существует)
     """
     participant = db.query(ChatParticipant).filter(
         ChatParticipant.chat_id == chat_id,
@@ -1779,13 +1753,9 @@ async def send_message(
     if not other_participant:
         raise HTTPException(404, "Получатель не найден")
     
-    # ✅ ПРОВЕРКА ПРИВАТНОСТИ
-    can_send, reason = await can_send_message_to_user(current_user.id, other_participant.user_id, db)
-    if not can_send:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=reason
-        )
+    # ✅ НЕ ПРОВЕРЯЕМ приватность для существующих чатов!
+    # Если чат уже существует - можно писать (как в Telegram/WhatsApp)
+    # Проверка приватности работает только при СОЗДАНИИ чата
     
     # ✅ ВОССТАНАВЛИВАЕМ ЧАТ ДЛЯ ОБОИХ УЧАСТНИКОВ
     all_participants = db.query(ChatParticipant).filter(
