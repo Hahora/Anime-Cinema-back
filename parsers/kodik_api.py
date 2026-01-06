@@ -1,21 +1,44 @@
 import re
 from typing import List, Dict, Any, Optional
-from anime_parsers_ru import KodikParserAsync
+from anime_parsers_ru import KodikParserAsync, ShikimoriParserAsync
 import asyncio
 
 
-_parser: Optional[KodikParserAsync] = None
+# ═══════════════════════════════════════════
+# SINGLETON ПАРСЕРЫ
+# ═══════════════════════════════════════════
+
+_kodik_parser: Optional[KodikParserAsync] = None
+_shikimori_parser: Optional[ShikimoriParserAsync] = None
 _parser_lock = asyncio.Lock()
 
 
-async def get_parser() -> KodikParserAsync:
-    """Singleton для парсера"""
-    global _parser
+async def get_kodik_parser() -> KodikParserAsync:
+    """Singleton для Kodik парсера"""
+    global _kodik_parser
     async with _parser_lock:
-        if _parser is None:
-            _parser = KodikParserAsync(validate_token=False)
-        return _parser
+        if _kodik_parser is None:
+            _kodik_parser = KodikParserAsync(validate_token=False)
+        return _kodik_parser
 
+
+async def get_shikimori_parser() -> ShikimoriParserAsync:
+    """Singleton для Shikimori парсера"""
+    global _shikimori_parser
+    async with _parser_lock:
+        if _shikimori_parser is None:
+            _shikimori_parser = ShikimoriParserAsync()
+        return _shikimori_parser
+
+
+# Для обратной совместимости
+async def get_parser() -> KodikParserAsync:
+    return await get_kodik_parser()
+
+
+# ═══════════════════════════════════════════
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ═══════════════════════════════════════════
 
 def normalize_shikimori_id(raw_id: Any) -> Optional[str]:
     """Приводит shikimori_id к формату Kodik (z123)"""
@@ -27,6 +50,16 @@ def normalize_shikimori_id(raw_id: Any) -> Optional[str]:
     return sid
 
 
+def get_clean_shikimori_id(raw_id: Any) -> Optional[str]:
+    """Получает чистый shikimori_id без префикса z (для Shikimori API)"""
+    if raw_id is None:
+        return None
+    sid = str(raw_id)
+    if sid.startswith("z"):
+        sid = sid[1:]
+    return sid
+
+
 def normalize_search_text(text: str) -> str:
     """
     Нормализует текст для поиска:
@@ -34,16 +67,109 @@ def normalize_search_text(text: str) -> str:
     - Заменяет ё на е
     - Убирает лишние пробелы
     """
-    # Убираем части типа [ТВ-1], [ТВ-2], [OVA] и т.д.
     text = re.sub(r'\s*\[.*?\]\s*', ' ', text)
-    
-    # Заменяем ё на е
     text = text.replace('ё', 'е').replace('Ё', 'Е')
-    
-    # Убираем лишние пробелы
     text = re.sub(r'\s+', ' ', text).strip()
-    
     return text
+
+
+def create_search_variants(text: str) -> List[str]:
+    """
+    Создаёт варианты поискового запроса для лучшего поиска:
+    - "джо джо" → ["джо джо", "джоджо", "джо-джо"]
+    - "ван пис" → ["ван пис", "ван-пис", "ванпис"]
+    - "наруто" → ["наруто"]
+    """
+    text = normalize_search_text(text)
+    variants = [text]
+    
+    words = text.split()
+    
+    if len(words) >= 2:
+        # Вариант с дефисами: "ван пис" → "ван-пис"
+        hyphenated = "-".join(words)
+        if hyphenated not in variants:
+            variants.append(hyphenated)
+        
+        # Вариант слитно: "джо джо" → "джоджо"
+        joined = "".join(words)
+        if joined not in variants:
+            variants.append(joined)
+        
+        # Для двух одинаковых коротких слов: "джо джо" → особый случай
+        if len(words) == 2 and words[0].lower() == words[1].lower():
+            # "джо джо" → "джоджо" (уже добавлено выше)
+            pass
+    
+    return variants
+
+
+# ═══════════════════════════════════════════
+# 🖼️ ПОЛУЧЕНИЕ ПОСТЕРА ИЗ SHIKIMORI
+# ═══════════════════════════════════════════
+
+async def get_poster_from_shikimori(shikimori_id: str) -> Optional[str]:
+    """
+    Получает постер аниме из Shikimori API
+    
+    Args:
+        shikimori_id: ID аниме (с или без префикса 'z')
+    
+    Returns:
+        URL постера или None
+    """
+    clean_id = get_clean_shikimori_id(shikimori_id)
+    if not clean_id:
+        return None
+    
+    try:
+        parser = await get_shikimori_parser()
+        
+        # Используем deep_anime_info для получения постера
+        info = await parser.deep_anime_info(
+            shikimori_id=clean_id,
+            return_parameters=['poster { originalUrl }']
+        )
+        
+        if info and 'poster' in info:
+            poster_data = info['poster']
+            if isinstance(poster_data, dict):
+                return poster_data.get('originalUrl')
+            return poster_data
+        
+        return None
+        
+    except Exception as e:
+        print(f"[SHIKIMORI POSTER ERROR] {e}")
+        return None
+
+
+async def get_posters_batch(shikimori_ids: List[str]) -> Dict[str, Optional[str]]:
+    """
+    Получает постеры для нескольких аниме (пакетный запрос)
+    
+    Args:
+        shikimori_ids: Список ID аниме
+    
+    Returns:
+        Словарь {shikimori_id: poster_url}
+    """
+    results = {}
+    
+    # Ограничиваем параллельные запросы чтобы не перегрузить Shikimori
+    semaphore = asyncio.Semaphore(5)
+    
+    async def fetch_poster(sid: str):
+        async with semaphore:
+            # Добавляем небольшую задержку между запросами
+            await asyncio.sleep(0.2)
+            poster = await get_poster_from_shikimori(sid)
+            results[sid] = poster
+    
+    tasks = [fetch_poster(sid) for sid in shikimori_ids if sid]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    
+    return results
 
 
 # ─────────────────────────────────────────────
@@ -52,103 +178,126 @@ def normalize_search_text(text: str) -> str:
 async def search_anime(title: str, limit: int = 12) -> List[Dict[str, Any]]:
     """
     Поиск аниме с группировкой по shikimori_id
+    ✅ Постеры загружаются из Shikimori
+    ✅ Умный поиск с вариантами запроса
     """
-    parser = await get_parser()
+    parser = await get_kodik_parser()
 
-    # ✅ Нормализуем поисковый запрос
+    # Создаём варианты поискового запроса
+    search_variants = create_search_variants(title)
     normalized_title = normalize_search_text(title)
-    print(f"🔍 Ищем: '{title}' → нормализовано: '{normalized_title}'")
+    print(f"🔍 Ищем: '{title}' → варианты: {search_variants}")
+
+    grouped: Dict[str, Dict] = {}
+    search_words = set(normalized_title.lower().split())
+    
+    # Также создаём слитный вариант для сравнения
+    search_joined = normalized_title.lower().replace(" ", "").replace("-", "")
 
     try:
-        # ✅ Убрали strict=True для более гибкого поиска
-        results = await parser.search(
-            title=normalized_title,
-            limit=limit * 20,  # ✅ Увеличили запас для фильтрации
-            only_anime=True,
-            include_material_data=True,
-            strict=False  # ✅ Более гибкий поиск
-        )
-
-        print(f"📊 Kodik вернул: {len(results)} результатов")
-
-        # Группируем по shikimori_id
-        grouped: Dict[str, Dict] = {}
-
-        # ✅ Нормализованный запрос для сравнения
-        search_words = set(normalized_title.lower().split())
-
-        for item in results:
-            shiki_id = normalize_shikimori_id(item.get("shikimori_id"))
-            if not shiki_id:
-                continue
-
-            # Если уже есть — пропускаем дубликаты
-            if shiki_id in grouped:
-                continue
-
-            material = item.get("material_data") or {}
-            title_ru = item.get("title", "")
-            title_orig = material.get("title_orig", "")
-            
-            # Фильтруем очевидные дубликаты и неподходящие
-            if not title_ru or len(title_ru) < 2:
-                continue
-
-            # ✅ Проверяем релевантность
-            # Нормализуем название аниме
-            normalized_anime_title = normalize_search_text(title_ru)
-            anime_words = set(normalized_anime_title.lower().split())
-            
-            # Проверяем также оригинальное название
-            if title_orig:
-                normalized_orig_title = normalize_search_text(title_orig)
-                anime_words.update(normalized_orig_title.lower().split())
-            
-            # Считаем совпадающие слова
-            matching_words = search_words.intersection(anime_words)
-            
-            # Если хотя бы 50% слов совпадают или это точное вхождение
-            relevance_ratio = len(matching_words) / len(search_words) if search_words else 0
-            
-            # ✅ Более мягкий фильтр релевантности
-            is_relevant = (
-                relevance_ratio >= 0.4 or  # 40% слов совпадают
-                normalized_title.lower() in normalized_anime_title.lower() or
-                normalized_anime_title.lower() in normalized_title.lower()
-            )
-            
-            if not is_relevant:
-                continue
-
-            grouped[shiki_id] = {
-                "id": shiki_id,
-                "title": title_ru,
-                "title_orig": title_orig,
-                "year": item.get("year"),
-                "type": item.get("type"),
-                "poster": item["screenshots"][0] if item.get("screenshots") else None,
-                "description": material.get("description"),
-                "genres": material.get("genres", []),
-                "status": material.get("status"),
-                "rating": material.get("shikimori_rating"),
-                "_relevance": relevance_ratio  # Для отладки
-            }
-
+        # Ищем по всем вариантам запроса
+        for variant in search_variants:
             if len(grouped) >= limit:
                 break
+                
+            try:
+                results = await parser.search(
+                    title=variant,
+                    limit=limit * 15,
+                    only_anime=True,
+                    include_material_data=True,
+                    strict=False
+                )
+                
+                print(f"📊 Вариант '{variant}': Kodik вернул {len(results)} результатов")
 
-        # ✅ Сортируем по релевантности
+                for item in results:
+                    shiki_id = normalize_shikimori_id(item.get("shikimori_id"))
+                    if not shiki_id:
+                        continue
+
+                    if shiki_id in grouped:
+                        continue
+
+                    material = item.get("material_data") or {}
+                    title_ru = item.get("title", "")
+                    title_orig = material.get("title_orig", "")
+                    
+                    if not title_ru or len(title_ru) < 2:
+                        continue
+
+                    # Проверяем релевантность
+                    normalized_anime_title = normalize_search_text(title_ru)
+                    anime_words = set(normalized_anime_title.lower().split())
+                    
+                    if title_orig:
+                        normalized_orig_title = normalize_search_text(title_orig)
+                        anime_words.update(normalized_orig_title.lower().split())
+                    
+                    # Слитный вариант названия для сравнения
+                    anime_title_joined = normalized_anime_title.lower().replace(" ", "").replace("-", "")
+                    
+                    matching_words = search_words.intersection(anime_words)
+                    relevance_ratio = len(matching_words) / len(search_words) if search_words else 0
+                    
+                    is_relevant = (
+                        relevance_ratio >= 0.4 or
+                        normalized_title.lower() in normalized_anime_title.lower() or
+                        normalized_anime_title.lower() in normalized_title.lower() or
+                        search_joined in anime_title_joined or
+                        anime_title_joined in search_joined
+                    )
+                    
+                    if not is_relevant:
+                        continue
+
+                    grouped[shiki_id] = {
+                        "id": shiki_id,
+                        "title": title_ru,
+                        "title_orig": title_orig,
+                        "year": item.get("year"),
+                        "type": item.get("type"),
+                        "poster": None,
+                        "screenshots": item.get("screenshots", []),
+                        "description": material.get("description"),
+                        "genres": material.get("genres", []),
+                        "status": material.get("status"),
+                        "rating": material.get("shikimori_rating"),
+                        "_relevance": relevance_ratio
+                    }
+
+                    if len(grouped) >= limit:
+                        break
+                        
+            except Exception as e:
+                print(f"⚠️ Ошибка поиска варианта '{variant}': {e}")
+                continue
+
+        # ✅ Загружаем постеры из Shikimori
+        if grouped:
+            print(f"🖼️ Загружаем постеры из Shikimori для {len(grouped)} аниме...")
+            posters = await get_posters_batch(list(grouped.keys()))
+            
+            for shiki_id, poster_url in posters.items():
+                if shiki_id in grouped:
+                    grouped[shiki_id]["poster"] = poster_url
+                    # Fallback на скриншот если постер не найден
+                    if not poster_url and grouped[shiki_id]["screenshots"]:
+                        grouped[shiki_id]["poster"] = grouped[shiki_id]["screenshots"][0]
+
+        # Сортируем по релевантности
         sorted_results = sorted(
             grouped.values(),
             key=lambda x: x.get("_relevance", 0),
             reverse=True
         )
         
-        # Убираем служебное поле
+        # Убираем служебные поля
         for r in sorted_results:
             r.pop("_relevance", None)
+            r.pop("screenshots", None)
         
-        print(f"✅ Отфильтровано: {len(sorted_results)} релевантных результатов")
+        print(f"✅ Итого найдено: {len(sorted_results)} релевантных результатов")
 
         return sorted_results[:limit]
 
@@ -163,8 +312,9 @@ async def search_anime(title: str, limit: int = 12) -> List[Dict[str, Any]]:
 async def get_anime_details(shikimori_id: str) -> Optional[Dict[str, Any]]:
     """
     Получение детальной информации об аниме
+    ✅ Постер загружается из Shikimori
     """
-    parser = await get_parser()
+    parser = await get_kodik_parser()
     shiki_id = normalize_shikimori_id(shikimori_id)
 
     if not shiki_id:
@@ -190,7 +340,15 @@ async def get_anime_details(shikimori_id: str) -> Optional[Dict[str, Any]]:
         anime = search_result[0]
         material = anime.get("material_data") or {}
 
-        # Обработка переводов - убираем дубликаты и сортируем
+        # 3️⃣ Получаем постер из Shikimori
+        print(f"🖼️ Загружаем постер из Shikimori для {shiki_id}...")
+        poster = await get_poster_from_shikimori(shiki_id)
+        
+        # Fallback на скриншот
+        if not poster and anime.get("screenshots"):
+            poster = anime["screenshots"][0]
+
+        # Обработка переводов
         translations = info.get("translations", [])
         seen_names = set()
         unique_translations = []
@@ -201,7 +359,6 @@ async def get_anime_details(shikimori_id: str) -> Optional[Dict[str, Any]]:
                 seen_names.add(name)
                 unique_translations.append(t)
 
-        # Сортируем переводы по популярности
         popular_studios = ["AniLibria", "AniDUB", "Animedia", "AniStar"]
         unique_translations.sort(
             key=lambda x: (
@@ -223,7 +380,7 @@ async def get_anime_details(shikimori_id: str) -> Optional[Dict[str, Any]]:
             "series_count": info.get("series_count", 1),
             "year": anime.get("year"),
             "rating": material.get("shikimori_rating"),
-            "poster": anime["screenshots"][0] if anime.get("screenshots") else None,
+            "poster": poster,  # ✅ Постер из Shikimori
             "screenshots": anime.get("screenshots", []),
             "translations": unique_translations,
             "next_episode_at": material.get("next_episode_at"),
@@ -247,14 +404,13 @@ async def get_video_m3u8(
     """
     Получение прямой ссылки на m3u8 плейлист
     """
-    parser = await get_parser()
+    parser = await get_kodik_parser()
     shiki_id = normalize_shikimori_id(shikimori_id)
 
     if not shiki_id:
         return None
 
     try:
-        # Для фильмов или одной серии - используем 0
         seria_num = episode_num if episode_num > 0 else 0
 
         url = await parser.get_m3u8_playlist_link(
@@ -265,7 +421,6 @@ async def get_video_m3u8(
             quality=quality
         )
 
-        # Добавляем протокол если нужно
         if url and url.startswith("//"):
             url = f"https:{url}"
 
@@ -276,15 +431,17 @@ async def get_video_m3u8(
         return None
     
 
+# ─────────────────────────────────────────────
+# 🎭 АНИМЕ ПО ЖАНРУ
+# ─────────────────────────────────────────────
 async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> Dict[str, Any]:
     """
-    Получение аниме по жанру с ЛЕНИВОЙ загрузкой
-    Каждый раз загружаем новую порцию из Kodik
+    Получение аниме по жанру с пагинацией
+    ✅ Постеры загружаются из Shikimori
     """
-    parser = await get_parser()
+    parser = await get_kodik_parser()
 
     try:
-        # ✅ Маппинг жанров - РАСШИРЕННЫЙ
         genre_lower = genre.lower()
         genre_mapping = {
             "экшен": ["action", "экшен", "экшн", "боевик"],
@@ -321,10 +478,7 @@ async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> D
 
         search_genres = genre_mapping.get(genre_lower, [genre_lower])
         
-        # ✅ Загружаем МНОГО страниц, чтобы после фильтрации осталось достаточно
-        # Например: запросили 10 аниме, но после фильтра может остаться 3-5
-        # Поэтому загружаем с запасом
-        pages_to_load = page * 3  # Множитель для запаса
+        pages_to_load = page * 3
         
         print(f"📄 Загружаем {pages_to_load} страниц из Kodik (page={page})")
 
@@ -337,7 +491,6 @@ async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> D
 
         print(f"📊 Получено из Kodik: {len(data)} записей")
 
-        # ✅ Фильтруем по жанру
         grouped: Dict[str, Dict] = {}
         
         for item in data:
@@ -348,7 +501,6 @@ async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> D
             material = item.get("material_data") or {}
             item_genres = material.get("genres", [])
             
-            # Проверяем совпадение жанра
             genre_match = any(
                 any(search.lower() in g.lower() for g in item_genres)
                 for search in search_genres
@@ -363,7 +515,8 @@ async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> D
                 "title_orig": material.get("title_orig"),
                 "year": item.get("year"),
                 "type": item.get("type"),
-                "poster": item["screenshots"][0] if item.get("screenshots") else None,
+                "poster": None,  # ← Заполним позже
+                "screenshots": item.get("screenshots", []),
                 "description": material.get("description"),
                 "genres": item_genres,
                 "status": material.get("status"),
@@ -372,11 +525,25 @@ async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> D
 
         all_results = list(grouped.values())
         
-        # ✅ Вычисляем offset для пагинации
+        # Пагинация
         offset = (page - 1) * per_page
         paginated = all_results[offset:offset + per_page]
         
-        # ✅ Проверяем есть ли ещё результаты
+        # ✅ Загружаем постеры только для текущей страницы
+        if paginated:
+            print(f"🖼️ Загружаем постеры из Shikimori для {len(paginated)} аниме...")
+            poster_ids = [item["id"] for item in paginated]
+            posters = await get_posters_batch(poster_ids)
+            
+            for item in paginated:
+                poster_url = posters.get(item["id"])
+                item["poster"] = poster_url
+                # Fallback на скриншот
+                if not poster_url and item.get("screenshots"):
+                    item["poster"] = item["screenshots"][0]
+                # Убираем скриншоты из ответа
+                item.pop("screenshots", None)
+        
         has_more = len(all_results) > offset + per_page or next_page is not None
         
         print(f"✅ Жанр '{genre}': отфильтровано {len(all_results)}, возвращаем {len(paginated)}")
@@ -398,8 +565,9 @@ async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> D
 async def get_trending_anime(limit: int = 12) -> List[Dict[str, Any]]:
     """
     Получение списка популярных аниме
+    ✅ Постеры загружаются из Shikimori
     """
-    parser = await get_parser()
+    parser = await get_kodik_parser()
 
     try:
         data, _ = await parser.get_list(
@@ -423,7 +591,8 @@ async def get_trending_anime(limit: int = 12) -> List[Dict[str, Any]]:
                 "title": item.get("title"),
                 "year": item.get("year"),
                 "type": item.get("type"),
-                "poster": item["screenshots"][0] if item.get("screenshots") else None,
+                "poster": None,  # ← Заполним позже
+                "screenshots": item.get("screenshots", []),
                 "rating": material.get("shikimori_rating"),
                 "status": material.get("status")
             }
@@ -431,7 +600,24 @@ async def get_trending_anime(limit: int = 12) -> List[Dict[str, Any]]:
             if len(grouped) >= limit:
                 break
 
-        return list(grouped.values())
+        results = list(grouped.values())
+        
+        # ✅ Загружаем постеры из Shikimori
+        if results:
+            print(f"🖼️ Загружаем постеры из Shikimori для {len(results)} аниме...")
+            poster_ids = [item["id"] for item in results]
+            posters = await get_posters_batch(poster_ids)
+            
+            for item in results:
+                poster_url = posters.get(item["id"])
+                item["poster"] = poster_url
+                # Fallback на скриншот
+                if not poster_url and item.get("screenshots"):
+                    item["poster"] = item["screenshots"][0]
+                # Убираем скриншоты из ответа
+                item.pop("screenshots", None)
+
+        return results
 
     except Exception as e:
         print(f"[KODIK TRENDING ERROR] {e}")
