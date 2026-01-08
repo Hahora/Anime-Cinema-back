@@ -71,7 +71,6 @@ app.add_middleware(
 socket_app = socketio.ASGIApp(
     sio,
     app,
-    socketio_path='/ws/socket.io'
 )
 
 # ═══════════════════════════════════════════
