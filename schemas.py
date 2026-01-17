@@ -13,14 +13,14 @@ class UserRegister(BaseModel):
     password: str = Field(..., min_length=8, max_length=72)  # ИСПРАВЛЕНО: max 72
     name: str = Field(..., min_length=2, max_length=100)
     admin_key: str
-    
+
     @validator('username')
     def username_alphanumeric(cls, v):
         """Только буквы, цифры, _ и -"""
         if not v.replace('_', '').replace('-', '').isalnum():
             raise ValueError('Неверный формат username')
         return v.lower()
-    
+
     @validator('password')
     def password_strength(cls, v):
         """Проверка силы пароля"""
@@ -56,10 +56,10 @@ class UserProfile(BaseModel):
     cover_url: str
     bio: str
     created_at: datetime
-    
+
     # ✅ Настройки приватности
     message_privacy: str = "all"  # all, friends_only, nobody
-    
+
     # Статистика
     total_anime: int = 0
     total_episodes: int = 0
@@ -77,7 +77,7 @@ class UserProfileUpdate(BaseModel):
     cover_url: Optional[str] = None
     bio: Optional[str] = None
     message_privacy: Optional[str] = None  # ✅ Добавлено
-    
+
     @validator('message_privacy')
     def validate_message_privacy(cls, v):
         """Проверка допустимых значений"""
@@ -172,6 +172,7 @@ class WatchHistoryItem(BaseModel):
     class Config:
         from_attributes = True
 
+
 # ДРУЗЬЯ
 # ═══════════════════════════════════════════
 
@@ -181,7 +182,7 @@ class UserShort(BaseModel):
     username: str
     name: str
     avatar_url: Optional[str]
-    
+
     class Config:
         from_attributes = True
 
@@ -201,7 +202,7 @@ class FriendshipItem(BaseModel):
     status: str
     created_at: datetime
     friend: UserShort  # Информация о друге
-    
+
     class Config:
         from_attributes = True
 
@@ -212,9 +213,10 @@ class FriendshipResponse(BaseModel):
     user: UserShort
     friend: UserShort
     created_at: datetime
-    
+
     class Config:
-        from_attributes = True        
+        from_attributes = True
+
 
 class NotificationItem(BaseModel):
     id: int
@@ -226,17 +228,19 @@ class NotificationItem(BaseModel):
     sender_avatar: Optional[str]
     is_read: bool
     created_at: datetime
-    
-    class Config:
-        from_attributes = True        
 
-# ═══════════════════════════════════════════
+    class Config:
+        from_attributes = True
+
+    # ═══════════════════════════════════════════
+
+
 # AUTH - БЕЗОПАСНОСТЬ
 # ═══════════════════════════════════════════
 
 class ChangeUsername(BaseModel):
     new_username: str
-    
+
     @validator('new_username')
     def validate_username(cls, v):
         if len(v) < 3:
@@ -251,13 +255,14 @@ class ChangeUsername(BaseModel):
 class ChangePassword(BaseModel):
     old_password: str
     new_password: str
-    
+
     @validator('new_password')
     def validate_password(cls, v):
         if len(v) < 6:
             raise ValueError('Пароль должен быть не менее 6 символов')
         return v
-    
+
+
 # Добавьте в конец файла
 
 # ═══════════════════════════════════════════
@@ -266,7 +271,7 @@ class ChangePassword(BaseModel):
 
 class MessageCreate(BaseModel):
     content: str = Field(..., min_length=1, max_length=5000)
-    
+
     @validator('content')
     def content_not_empty(cls, v):
         if not v.strip():
@@ -284,8 +289,8 @@ class MessageItem(BaseModel):
     created_at: datetime
     is_edited: bool
     edited_at: Optional[datetime]
-    is_read: bool = False 
-    
+    is_read: bool = False
+
     class Config:
         from_attributes = True
 
@@ -295,21 +300,21 @@ class ChatItem(BaseModel):
     type: str
     created_at: datetime
     updated_at: datetime
-    
+
     # Информация о собеседнике (для приватных чатов)
     other_user_id: Optional[int] = None
     other_user_name: Optional[str] = None
     other_user_username: Optional[str] = None
     other_user_avatar: Optional[str] = None
-    
+
     # Последнее сообщение
     last_message: Optional[str] = None
     last_message_time: Optional[datetime] = None
     last_message_sender_id: Optional[int] = None
-    
+
     # Непрочитанные
     unread_count: int = 0
-    
+
     class Config:
         from_attributes = True
 

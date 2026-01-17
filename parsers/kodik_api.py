@@ -3,7 +3,6 @@ from typing import List, Dict, Any, Optional
 from anime_parsers_ru import KodikParserAsync, ShikimoriParserAsync
 import asyncio
 
-
 # ═══════════════════════════════════════════
 # SINGLETON ПАРСЕРЫ
 # ═══════════════════════════════════════════
@@ -82,25 +81,25 @@ def create_search_variants(text: str) -> List[str]:
     """
     text = normalize_search_text(text)
     variants = [text]
-    
+
     words = text.split()
-    
+
     if len(words) >= 2:
         # Вариант с дефисами: "ван пис" → "ван-пис"
         hyphenated = "-".join(words)
         if hyphenated not in variants:
             variants.append(hyphenated)
-        
+
         # Вариант слитно: "джо джо" → "джоджо"
         joined = "".join(words)
         if joined not in variants:
             variants.append(joined)
-        
+
         # Для двух одинаковых коротких слов: "джо джо" → особый случай
         if len(words) == 2 and words[0].lower() == words[1].lower():
             # "джо джо" → "джоджо" (уже добавлено выше)
             pass
-    
+
     return variants
 
 
@@ -121,24 +120,24 @@ async def get_poster_from_shikimori(shikimori_id: str) -> Optional[str]:
     clean_id = get_clean_shikimori_id(shikimori_id)
     if not clean_id:
         return None
-    
+
     try:
         parser = await get_shikimori_parser()
-        
+
         # Используем deep_anime_info для получения постера
         info = await parser.deep_anime_info(
             shikimori_id=clean_id,
             return_parameters=['poster { originalUrl }']
         )
-        
+
         if info and 'poster' in info:
             poster_data = info['poster']
             if isinstance(poster_data, dict):
                 return poster_data.get('originalUrl')
             return poster_data
-        
+
         return None
-        
+
     except Exception as e:
         print(f"[SHIKIMORI POSTER ERROR] {e}")
         return None
@@ -155,20 +154,20 @@ async def get_posters_batch(shikimori_ids: List[str]) -> Dict[str, Optional[str]
         Словарь {shikimori_id: poster_url}
     """
     results = {}
-    
+
     # Ограничиваем параллельные запросы чтобы не перегрузить Shikimori
     semaphore = asyncio.Semaphore(5)
-    
+
     async def fetch_poster(sid: str):
         async with semaphore:
             # Добавляем небольшую задержку между запросами
             await asyncio.sleep(0.2)
             poster = await get_poster_from_shikimori(sid)
             results[sid] = poster
-    
+
     tasks = [fetch_poster(sid) for sid in shikimori_ids if sid]
     await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     return results
 
 
@@ -190,7 +189,7 @@ async def search_anime(title: str, limit: int = 12) -> List[Dict[str, Any]]:
 
     grouped: Dict[str, Dict] = {}
     search_words = set(normalized_title.lower().split())
-    
+
     # Также создаём слитный вариант для сравнения
     search_joined = normalized_title.lower().replace(" ", "").replace("-", "")
 
@@ -199,7 +198,7 @@ async def search_anime(title: str, limit: int = 12) -> List[Dict[str, Any]]:
         for variant in search_variants:
             if len(grouped) >= limit:
                 break
-                
+
             try:
                 results = await parser.search(
                     title=variant,
@@ -208,7 +207,7 @@ async def search_anime(title: str, limit: int = 12) -> List[Dict[str, Any]]:
                     include_material_data=True,
                     strict=False
                 )
-                
+
                 print(f"📊 Вариант '{variant}': Kodik вернул {len(results)} результатов")
 
                 for item in results:
@@ -222,32 +221,32 @@ async def search_anime(title: str, limit: int = 12) -> List[Dict[str, Any]]:
                     material = item.get("material_data") or {}
                     title_ru = item.get("title", "")
                     title_orig = material.get("title_orig", "")
-                    
+
                     if not title_ru or len(title_ru) < 2:
                         continue
 
                     # Проверяем релевантность
                     normalized_anime_title = normalize_search_text(title_ru)
                     anime_words = set(normalized_anime_title.lower().split())
-                    
+
                     if title_orig:
                         normalized_orig_title = normalize_search_text(title_orig)
                         anime_words.update(normalized_orig_title.lower().split())
-                    
+
                     # Слитный вариант названия для сравнения
                     anime_title_joined = normalized_anime_title.lower().replace(" ", "").replace("-", "")
-                    
+
                     matching_words = search_words.intersection(anime_words)
                     relevance_ratio = len(matching_words) / len(search_words) if search_words else 0
-                    
+
                     is_relevant = (
-                        relevance_ratio >= 0.4 or
-                        normalized_title.lower() in normalized_anime_title.lower() or
-                        normalized_anime_title.lower() in normalized_title.lower() or
-                        search_joined in anime_title_joined or
-                        anime_title_joined in search_joined
+                            relevance_ratio >= 0.4 or
+                            normalized_title.lower() in normalized_anime_title.lower() or
+                            normalized_anime_title.lower() in normalized_title.lower() or
+                            search_joined in anime_title_joined or
+                            anime_title_joined in search_joined
                     )
-                    
+
                     if not is_relevant:
                         continue
 
@@ -268,7 +267,7 @@ async def search_anime(title: str, limit: int = 12) -> List[Dict[str, Any]]:
 
                     if len(grouped) >= limit:
                         break
-                        
+
             except Exception as e:
                 print(f"⚠️ Ошибка поиска варианта '{variant}': {e}")
                 continue
@@ -277,7 +276,7 @@ async def search_anime(title: str, limit: int = 12) -> List[Dict[str, Any]]:
         if grouped:
             print(f"🖼️ Загружаем постеры из Shikimori для {len(grouped)} аниме...")
             posters = await get_posters_batch(list(grouped.keys()))
-            
+
             for shiki_id, poster_url in posters.items():
                 if shiki_id in grouped:
                     grouped[shiki_id]["poster"] = poster_url
@@ -291,12 +290,12 @@ async def search_anime(title: str, limit: int = 12) -> List[Dict[str, Any]]:
             key=lambda x: x.get("_relevance", 0),
             reverse=True
         )
-        
+
         # Убираем служебные поля
         for r in sorted_results:
             r.pop("_relevance", None)
             r.pop("screenshots", None)
-        
+
         print(f"✅ Итого найдено: {len(sorted_results)} релевантных результатов")
 
         return sorted_results[:limit]
@@ -343,7 +342,7 @@ async def get_anime_details(shikimori_id: str) -> Optional[Dict[str, Any]]:
         # 3️⃣ Получаем постер из Shikimori
         print(f"🖼️ Загружаем постер из Shikimori для {shiki_id}...")
         poster = await get_poster_from_shikimori(shiki_id)
-        
+
         # Fallback на скриншот
         if not poster and anime.get("screenshots"):
             poster = anime["screenshots"][0]
@@ -352,7 +351,7 @@ async def get_anime_details(shikimori_id: str) -> Optional[Dict[str, Any]]:
         translations = info.get("translations", [])
         seen_names = set()
         unique_translations = []
-        
+
         for t in translations:
             name = t.get("name", "").strip()
             if name and name not in seen_names:
@@ -396,10 +395,10 @@ async def get_anime_details(shikimori_id: str) -> Optional[Dict[str, Any]]:
 # 🎬 M3U8 ВИДЕО
 # ─────────────────────────────────────────────
 async def get_video_m3u8(
-    shikimori_id: str,
-    episode_num: int,
-    translation_id: str,
-    quality: int = 720
+        shikimori_id: str,
+        episode_num: int,
+        translation_id: str,
+        quality: int = 720
 ) -> Optional[str]:
     """
     Получение прямой ссылки на m3u8 плейлист
@@ -429,7 +428,7 @@ async def get_video_m3u8(
     except Exception as e:
         print(f"[KODIK VIDEO ERROR] {e}")
         return None
-    
+
 
 # ─────────────────────────────────────────────
 # 🎭 АНИМЕ ПО ЖАНРУ
@@ -477,9 +476,9 @@ async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> D
         }
 
         search_genres = genre_mapping.get(genre_lower, [genre_lower])
-        
+
         pages_to_load = page * 3
-        
+
         print(f"📄 Загружаем {pages_to_load} страниц из Kodik (page={page})")
 
         data, next_page = await parser.get_list(
@@ -492,7 +491,7 @@ async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> D
         print(f"📊 Получено из Kodik: {len(data)} записей")
 
         grouped: Dict[str, Dict] = {}
-        
+
         for item in data:
             shiki_id = normalize_shikimori_id(item.get("shikimori_id"))
             if not shiki_id or shiki_id in grouped:
@@ -500,7 +499,7 @@ async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> D
 
             material = item.get("material_data") or {}
             item_genres = material.get("genres", [])
-            
+
             genre_match = any(
                 any(search.lower() in g.lower() for g in item_genres)
                 for search in search_genres
@@ -524,17 +523,17 @@ async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> D
             }
 
         all_results = list(grouped.values())
-        
+
         # Пагинация
         offset = (page - 1) * per_page
         paginated = all_results[offset:offset + per_page]
-        
+
         # ✅ Загружаем постеры только для текущей страницы
         if paginated:
             print(f"🖼️ Загружаем постеры из Shikimori для {len(paginated)} аниме...")
             poster_ids = [item["id"] for item in paginated]
             posters = await get_posters_batch(poster_ids)
-            
+
             for item in paginated:
                 poster_url = posters.get(item["id"])
                 item["poster"] = poster_url
@@ -543,11 +542,11 @@ async def get_anime_by_genre(genre: str, page: int = 1, per_page: int = 10) -> D
                     item["poster"] = item["screenshots"][0]
                 # Убираем скриншоты из ответа
                 item.pop("screenshots", None)
-        
+
         has_more = len(all_results) > offset + per_page or next_page is not None
-        
+
         print(f"✅ Жанр '{genre}': отфильтровано {len(all_results)}, возвращаем {len(paginated)}")
-        
+
         return {
             "results": paginated,
             "has_more": has_more,
@@ -585,7 +584,7 @@ async def get_trending_anime(limit: int = 12) -> List[Dict[str, Any]]:
                 continue
 
             material = item.get("material_data") or {}
-            
+
             grouped[shiki_id] = {
                 "id": shiki_id,
                 "title": item.get("title"),
@@ -601,13 +600,13 @@ async def get_trending_anime(limit: int = 12) -> List[Dict[str, Any]]:
                 break
 
         results = list(grouped.values())
-        
+
         # ✅ Загружаем постеры из Shikimori
         if results:
             print(f"🖼️ Загружаем постеры из Shikimori для {len(results)} аниме...")
             poster_ids = [item["id"] for item in results]
             posters = await get_posters_batch(poster_ids)
-            
+
             for item in results:
                 poster_url = posters.get(item["id"])
                 item["poster"] = poster_url

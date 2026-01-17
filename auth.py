@@ -20,7 +20,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 43200
 ADMIN_REGISTRATION_KEY = os.getenv("ADMIN_REGISTRATION_KEY")
 
 pwd_context = CryptContext(
-    schemes=["argon2"], 
+    schemes=["argon2"],
     deprecated="auto",
 )
 
@@ -44,15 +44,15 @@ def get_password_hash(password: str) -> str:
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """Создаёт JWT токен"""
     to_encode = data.copy()
-    
+
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
         expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    
+
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    
+
     return encoded_jwt
 
 
@@ -62,8 +62,8 @@ def verify_admin_key(admin_key: str) -> bool:
 
 
 async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: Session = Depends(get_db)
+        token: str = Depends(oauth2_scheme),
+        db: Session = Depends(get_db)
 ) -> User:
     """
     Получает текущего пользователя из токена.
@@ -74,7 +74,7 @@ async def get_current_user(
         detail="Неверные учетные данные",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    
+
     try:
         # Расшифровываем токен
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -83,18 +83,18 @@ async def get_current_user(
             raise credentials_exception
     except JWTError:
         raise credentials_exception
-    
+
     # Ищем пользователя в БД
     user = db.query(User).filter(User.username == username).first()
-    
+
     if user is None:
         raise credentials_exception
-    
+
     return user
 
 
 async def get_current_active_user(
-    current_user: User = Depends(get_current_user)
+        current_user: User = Depends(get_current_user)
 ) -> User:
     """Проверяет, что пользователь активен"""
     if not current_user.is_active:
