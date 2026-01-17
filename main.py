@@ -10,7 +10,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta
 import socketio
 
-from database import get_db, init_db
+from database import get_db
 from models import User, Favorite, WatchedAnime, WatchHistory, Friendship, Notification, Chat, ChatParticipant, Message, MessageEditHistory
 from schemas import (
     UserRegister, Token, UserProfile, UserProfileUpdate,
@@ -42,9 +42,6 @@ from websocket_manager import (
     send_friend_rejected_notification,
     get_connection_stats
 )
-
-# Создаём таблицы при запуске
-init_db()
 
 app = FastAPI(
     title="Anime Cinema API",

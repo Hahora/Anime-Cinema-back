@@ -15,7 +15,7 @@ if not DATABASE_URL:
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,  # Проверяет соединение перед использованием
-    echo=False,          # True - показывает SQL запросы (для дебага)
+    echo=False,  # True - показывает SQL запросы (для дебага)
 )
 
 # Фабрика сессий - для работы с БД
@@ -39,19 +39,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
-
-def init_db():
-    """
-    Создаёт все таблицы в базе данных.
-    Вызывается при первом запуске.
-    """
-    # Импортируем модели, чтобы SQLAlchemy их увидел
-    import models
-    
-    # Создаём таблицы
-    Base.metadata.create_all(bind=engine)
-    print("✅ Таблицы созданы!")
 
 
 def test_connection():
