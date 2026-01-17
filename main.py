@@ -1,32 +1,22 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Request
-from fastapi.responses import JSONResponse
+from datetime import datetime, timedelta
+from typing import List, Optional
+
+import socketio
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import text, or_, and_
-from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
-from typing import List, Optional
-from datetime import datetime, timedelta
-import socketio
+from sqlalchemy import or_, and_
+from sqlalchemy.orm import Session
 
-from database import get_db
-from models import User, Favorite, WatchedAnime, WatchHistory, Friendship, Notification, Chat, ChatParticipant, Message, \
-    MessageEditHistory
-from schemas import (
-    UserRegister, Token, UserProfile, UserProfileUpdate,
-    FavoriteAdd, FavoriteItem,
-    WatchedAnimeUpdate, WatchedAnimeItem,
-    WatchHistoryAdd, WatchHistoryItem,
-    UserShort, FriendshipCreate, FriendshipItem, FriendshipResponse, NotificationItem,
-    ChangeUsername, ChangePassword,
-    ChatCreate, ChatItem, MessageCreate, MessageItem
-)
 from auth import (
     get_password_hash, verify_password, create_access_token,
     get_current_active_user, verify_admin_key
 )
-
+from database import get_db
+from models import User, Favorite, WatchedAnime, WatchHistory, Friendship, Notification, Chat, ChatParticipant, Message, \
+    MessageEditHistory
 # Импорт парсера аниме
 from parsers.kodik_api import (
     search_anime,
@@ -35,7 +25,15 @@ from parsers.kodik_api import (
     get_trending_anime,
     get_anime_by_genre
 )
-
+from schemas import (
+    UserRegister, Token, UserProfile, UserProfileUpdate,
+    FavoriteAdd, FavoriteItem,
+    WatchedAnimeUpdate, WatchedAnimeItem,
+    WatchHistoryAdd, WatchHistoryItem,
+    UserShort, FriendshipCreate, FriendshipResponse, NotificationItem,
+    ChangeUsername, ChangePassword,
+    ChatCreate, ChatItem, MessageCreate, MessageItem
+)
 from websocket_manager import (
     sio,
     send_friend_request_notification,
@@ -1635,7 +1633,6 @@ async def get_chat_item(chat_id: int, user_id: int, db: Session) -> ChatItem:
     ).first()
 
     # ✅ Считаем непрочитанные С УЧЁТОМ restored_at
-    from sqlalchemy import func, desc
 
     unread_query = db.query(Message).filter(
         Message.chat_id == chat_id,
