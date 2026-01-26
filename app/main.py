@@ -36,7 +36,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory="../static"), name="static")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.include_router(anime_router)
 app.include_router(auth_router)
@@ -90,15 +90,4 @@ async def general_exception_handler(request: Request, exc: Exception):
             "error": "Внутренняя ошибка сервера",
             "status_code": 500
         }
-    )
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        socket_app,
-        host="127.0.0.1",
-        port=8000,
-        log_level="info",
     )
